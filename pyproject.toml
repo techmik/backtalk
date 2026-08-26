@@ -15,6 +15,9 @@ dependencies = [
     # platform keeps faster-whisper, which already uses CUDA.
     "mlx-whisper>=0.4.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26.0",
+    "nvidia-cublas-cu12>=12.9.2.10",
+    "nvidia-cuda-runtime-cu12>=12.9.79",
+    "nvidia-cudnn-cu12>=9.24.0.43",
     "pynput>=1.8.0",
     "setuptools<81",
     "sounddevice>=0.5.0",

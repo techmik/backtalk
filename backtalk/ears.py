@@ -25,6 +25,7 @@ an utterance opens after ~120ms of sustained speech, closes after
 `silence_ms` of trailing quiet. A `gate` callable can suppress
 listening (so the open mic ignores the speakers unless barge-in is on).
 """
+import os
 import platform
 import re
 import sys
@@ -48,6 +49,7 @@ _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 _model = None
 _model_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
+_device = None           # device actually in use (post-fallback), faster-whisper only
 _warned_missing_device = False
 
 
@@ -125,11 +127,53 @@ def _mlx_repo(model_name: str) -> str:
     return f"mlx-community/whisper-{model_name}-mlx"
 
 
+def _add_nvidia_dll_dirs():
+    """Windows only. pip-installed nvidia-cublas-cu12 / nvidia-cudnn-cu12 /
+    nvidia-cuda-runtime-cu12 drop their DLLs under site-packages/nvidia/
+    <pkg>/bin, which Windows never adds to the DLL search path on its own
+    -- a real CUDA Toolkit install would put itself on PATH, this doesn't.
+    os.add_dll_directory() alone isn't enough either: CTranslate2's native
+    loader doesn't use the LoadLibraryEx flags that respect it, and falls
+    back to the plain PATH env var instead -- confirmed by testing both
+    against this exact cublas64_12.dll-not-found failure. Without this,
+    CUDA fails at first inference even though the packages are installed."""
+    if sys.platform != "win32":
+        return
+    import importlib.util
+    dirs = []
+    for pkg in ("cublas", "cudnn", "cuda_runtime"):
+        spec = importlib.util.find_spec(f"nvidia.{pkg}")
+        if not spec or not spec.submodule_search_locations:
+            continue
+        bin_dir = os.path.join(spec.submodule_search_locations[0], "bin")
+        if os.path.isdir(bin_dir):
+            dirs.append(bin_dir)
+    if dirs:
+        os.environ["PATH"] = os.pathsep.join(dirs) + os.pathsep + os.environ["PATH"]
+
+
+def _load_faster_whisper(device: str, compute_type: str):
+    """Load faster-whisper on `device`, falling back to CPU on failure.
+    A missing/broken CUDA library can surface here at construction, or
+    only later on first real inference (see the try/except in
+    transcribe()) -- CTranslate2 doesn't touch cuBLAS until it actually
+    needs it."""
+    from faster_whisper import WhisperModel
+    log(f"[ears] loading {CFG['stt_model']} ({device}/{compute_type})...")
+    try:
+        return WhisperModel(CFG["stt_model"], device=device, compute_type=compute_type), device
+    except Exception:
+        if device == "cpu":
+            raise
+        log(f"[ears] failed to load Whisper on device={device} -- falling back to CPU")
+        return WhisperModel(CFG["stt_model"], device="cpu", compute_type="int8"), "cpu"
+
+
 def warm():
     """Load the STT model (first call downloads it to the HF cache).
     Called at startup while the greeting plays, so the first real
     utterance doesn't pay the load."""
-    global _model, _backend
+    global _model, _backend, _device
     with _model_lock:
         if _model is None:
             if _apple_gpu_available():
@@ -144,12 +188,8 @@ def warm():
                                        verbose=None)
                 _model, _backend = repo, "mlx"
             else:
-                from faster_whisper import WhisperModel
-                log(f"[ears] loading {CFG['stt_model']} "
-                    f"({CFG['stt_device']}/{CFG['stt_compute']})...")
-                _model = WhisperModel(CFG["stt_model"],
-                                      device=CFG["stt_device"],
-                                      compute_type=CFG["stt_compute"])
+                _add_nvidia_dll_dirs()
+                _model, _device = _load_faster_whisper(CFG["stt_device"], CFG["stt_compute"])
                 _backend = "faster-whisper"
             log(f"[ears] model ready ({_backend})")
     return _model
@@ -168,8 +208,22 @@ def transcribe(pcm: np.ndarray) -> str:
                                       temperature=0.0, language=lang,
                                       verbose=None)["text"].strip()
     else:
-        segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
-        text = "".join(s.text for s in segments).strip()
+        global _model, _device
+        try:
+            segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
+            text = "".join(s.text for s in segments).strip()
+        except Exception:
+            # segments is a lazy generator -- decoding (and so a CUDA
+            # failure) can happen during the join above, not during the
+            # transcribe() call, which is why this can't be caught in
+            # _load_faster_whisper alone.
+            if _device == "cpu":
+                raise
+            log(f"[ears] CUDA transcription failed on device={_device} -- reloading on CPU and retrying")
+            _model, _device = _load_faster_whisper("cpu", "int8")
+            model = _model
+            segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
+            text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
 
 
