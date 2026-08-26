@@ -48,6 +48,54 @@ _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 _model = None
 _model_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
+_warned_missing_device = False
+
+
+def _input_device():
+    """Resolve CFG["mic_device_name"] to a PortAudio input device index
+    via case-insensitive substring match. "" or no match -> None, which
+    means "let PortAudio use the OS default recording device" — the
+    same fallback voice-line uses, logged once rather than every call.
+
+    On Windows the same physical device is enumerated once per host API
+    (MME, DirectSound, WASAPI, WDM-KS); MME's name is truncated by
+    PortAudio's fixed-length buffer, which can make a plain first-match
+    land on the DirectSound copy. WASAPI is the modern shared-mode API
+    with the best resampling quality, so prefer it among matches."""
+    global _warned_missing_device
+    name = CFG.get("mic_device_name", "")
+    if not name:
+        return None
+    name_low = name.lower()
+    apis = sd.query_hostapis()
+    matches = [(i, d) for i, d in enumerate(sd.query_devices())
+               if d["max_input_channels"] > 0 and name_low in d["name"].lower()]
+    for i, d in matches:
+        if apis[d["hostapi"]]["name"] == "Windows WASAPI":
+            return i
+    if matches:
+        return matches[0][0]
+    if not _warned_missing_device:
+        log(f"[ears] mic_device_name {name!r} not found — "
+            f"using system default")
+        _warned_missing_device = True
+    return None
+
+
+def _wasapi_settings(device):
+    """WASAPI shared-mode streams reject any samplerate but the device's
+    own mix format unless auto-convert is explicitly requested — MME and
+    DirectSound resample for free, WASAPI doesn't. Returns a WasapiSettings
+    enabling it when `device` (or the OS default input when None) is on
+    WASAPI, else None. No-op on macOS/Linux, which have no such hostapi."""
+    try:
+        d = sd.query_devices(device) if device is not None \
+            else sd.query_devices(kind="input")
+    except Exception:
+        return None
+    if sd.query_hostapis()[d["hostapi"]]["name"] == "Windows WASAPI":
+        return sd.WasapiSettings(auto_convert=True)
+    return None
 
 
 def _apple_gpu_available() -> bool:
@@ -145,8 +193,11 @@ class Ears:
         in_utterance = False
         elapsed = 0.0
 
+        dev = _input_device()
         with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                            blocksize=FRAME_LEN) as stream:
+                            blocksize=FRAME_LEN, device=dev,
+                            extra_settings=_wasapi_settings(dev)) \
+                as stream:
             while True:
                 block, _ = stream.read(FRAME_LEN)
                 elapsed += FRAME_MS / 1000
@@ -193,8 +244,11 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
     frames: list[np.ndarray] = []
+    dev = _input_device()
     with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                        blocksize=FRAME_LEN) as stream:
+                        blocksize=FRAME_LEN, device=dev,
+                        extra_settings=_wasapi_settings(dev)) \
+            as stream:
         while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
             block, _ = stream.read(FRAME_LEN)
             frames.append(block[:, 0].copy())

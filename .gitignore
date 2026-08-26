@@ -6,6 +6,8 @@ logs/
 .voice_state
 .voice_waveform
 .voice_loading_pid
+.voice_transcript.jsonl
+.voice_inbox/
 uv.lock
 backtalk.egg-info/
 # your personal config, created at setup: never tracked, never touched by updates

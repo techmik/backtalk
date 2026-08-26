@@ -20,12 +20,24 @@
 The voice line leaves notes; faces read the notes. That one dumb trick
 is the whole integration surface:
 
-  .voice_state        idle | listening | thinking | speaking
-  .voice_waveform     JSON {ts, samples: [64 floats]} while audio plays
-  .voice_loading_pid  exists while the thinking sound is playing
+  .voice_state          idle | listening | thinking | speaking
+  .voice_waveform       JSON {ts, samples: [64 floats]} while audio plays
+  .voice_loading_pid    exists while the thinking sound is playing
+  .voice_transcript.jsonl
+                        append-only log, one JSON object per line:
+                        {"ts": epoch, "role": "user"|"assistant", "text": ...}
+                        Truncated fresh at every launch (not a permanent
+                        log — backtalk.log is that). A dashboard tailing
+                        this sees the whole conversation, typed or spoken.
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
+
+THE ONE REVERSED FILE: .voice_inbox/ is written by something ELSE (a
+dashboard) and read by backtalk — main.py's _inbox_reader polls it and
+feeds typed_q, same as terminal input. Not this module's concern; it
+lives here only as a fact about the bus, since everything else in this
+file is backtalk -> world.
 
 THE BAREHANDS SEAM: set barehands_state_dir in backtalk.json to a
 barehands checkout's state/ folder and the same signals are mirrored in
@@ -50,6 +62,7 @@ _WAVEFORM_FILE = os.path.join(_DIR, ".voice_waveform")
 _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
+_TRANSCRIPT_FILE = os.path.join(_DIR, ".voice_transcript.jsonl")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -137,6 +150,27 @@ def reply_done():
     try:
         with open(_REPLY_DONE_FILE, "w") as f:
             f.write(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
+
+
+def transcript_reset():
+    """Clear the transcript at the start of a session (fresh, not
+    permanent — backtalk.log already keeps the real history). Never
+    raises."""
+    try:
+        open(_TRANSCRIPT_FILE, "w").close()
+    except OSError:
+        pass
+
+
+def transcript(role: str, text: str):
+    """Append one turn of dialogue (role: "user" or "assistant") for a
+    dashboard to tail. Never raises."""
+    try:
+        with open(_TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.time(), "role": role,
+                                "text": text}) + "\n")
     except OSError:
         pass
 

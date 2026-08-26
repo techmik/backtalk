@@ -396,6 +396,14 @@ _PASTE_OFF = "\x1b[201~"
 # swallow a paragraph into one "tag".
 _DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
 
+# A "Sources:" heading (optionally markdown-bolded) marks the start of a
+# citation list — print it, never speak it. See speak_reply's emit().
+# PREFIX match, not full: the heading and its link list can arrive fused
+# into one chunk (no sentence-ending punctuation inside a bare URL/title
+# for _SENTENCE_END to split on), so "starts with Sources:" has to catch
+# that fused blob too, not just a lone heading line.
+_SOURCES_HEADING = re.compile(r"^\**Sources:?\**", re.IGNORECASE)
+
 
 def _clean_typed(line: str) -> str:
     """Scrub terminal-copy artifacts: blockquote gutter glyphs and stray
@@ -568,6 +576,36 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
+def _inbox_reader(q: "queue.Queue[str]"):
+    """Poll .voice_inbox/ (in signals_dir) for messages dropped by
+    something else — the ai-visualizer dashboard's send box, currently.
+    Each file is one atomically-written message (dashboard writes temp
+    then renames, so a half-written file is never seen here); read,
+    delete, enqueue, same as a typed line. Daemon thread, never dies on
+    a transient OSError (a file can vanish between listdir and read if
+    two readers ever raced, which they don't today, but the bus contract
+    says these writes must never crash the voice line)."""
+    import os
+    inbox = os.path.join(CFG["signals_dir"], ".voice_inbox")
+    os.makedirs(inbox, exist_ok=True)
+    while True:
+        try:
+            names = sorted(os.listdir(inbox))
+        except OSError:
+            names = []
+        for name in names:
+            path = os.path.join(inbox, name)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read().strip()
+                os.remove(path)
+            except OSError:
+                continue
+            if text:
+                q.put(text)
+        time.sleep(0.2)
+
+
 async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
@@ -576,9 +614,10 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     first = True
     batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
+    sources_started = False          # once true, print-only: never spoken
 
     def emit(raw: str):
-        nonlocal first, batch, pending
+        nonlocal first, batch, pending, sources_started
         # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
         # lifted out here, never spoken, and published on the signal bus when
         # this chunk's audio starts (signals.direction). backtalk has no
@@ -593,6 +632,17 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         # TTS hygiene: backticks and markdown fences are never speakable.
         s = " ".join(raw.replace("`", "").split()).strip()
         if not s:
+            return
+        signals.transcript("assistant", s)
+        # SOURCES: a trailing "Sources:" list (WebSearch's mandatory
+        # citation block) is for reading, not hearing — a wall of titles
+        # and URLs read aloud is unbearable and the discipline prompt
+        # already bans spoken URLs anyway. Once the heading shows up,
+        # everything after it still prints/logs but never reaches the mouth.
+        if not sources_started and _SOURCES_HEADING.match(s):
+            sources_started = True
+        if sources_started:
+            log(f"[{NAME}] {s}")
             return
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
@@ -708,8 +758,10 @@ async def amain():
         log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
 
     speak_task: asyncio.Task | None = None
+    signals.transcript_reset()
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
+    threading.Thread(target=_inbox_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
@@ -851,6 +903,7 @@ async def amain():
         told apart from speech that began before the ask even existed."""
         nonlocal speak_task
         log(f"[you]    {text}")
+        signals.transcript("user", text)
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
         # began earlier is the user interrupting the turn, not

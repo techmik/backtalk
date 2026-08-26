@@ -132,6 +132,17 @@ DEFAULTS = {
     # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
     "stt_device": "auto",
     "stt_compute": "int8",
+    # Pin capture to one input device by name (case-insensitive substring
+    # match, e.g. "CMTECK" or "USB"). "" follows Windows' current default
+    # recording device instead. Set this if you ever switch the OS
+    # default to a Bluetooth headset for some other app's dictation —
+    # without a pin, that silently drags this mic onto Bluetooth too,
+    # and a device that's both mic and speaker forces the link into
+    # HFP (mic-capable, low quality), blocking the higher-quality A2DP
+    # mode every other app wants for playback through the same device.
+    # A device named here that isn't found falls back to the system
+    # default and logs it once — never a hard failure.
+    "mic_device_name": "",
     # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
     # goes in a file: it's read from the macOS Keychain (item
     # `backtalk-elevenlabs`) or Linux secret-tool, with the

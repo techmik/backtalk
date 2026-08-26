@@ -328,6 +328,9 @@ class Mouth:
             signals.set_state("speaking")
             try:
                 self._play_stream(sentence, directions)
+            except sd.PortAudioError as e:
+                log(f"[mouth] synth/play error: {e}")
+                self._reinit_audio()
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
@@ -377,6 +380,20 @@ class Mouth:
                 pass
         self._out = None
         self._out_rate = None
+
+    def _reinit_audio(self):
+        """Recover from a hot-plug topology change (an output device
+        unplugged/replugged mid-process). _drop_out alone isn't enough
+        here: PortAudio's own device table goes stale in-process on a
+        topology change, so even a freshly-opened stream keeps hitting
+        the same dead handle (PaErrorCode -9999, MME error 6) until
+        PortAudio itself is reinitialized."""
+        self._drop_out()
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            log(f"[mouth] PortAudio reinit failed: {e}")
 
     def _play_stream(self, sentence: str, directions=None, block: int = 2205,
                      prebuffer_s: float = 0.75):
