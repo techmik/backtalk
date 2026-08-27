@@ -42,6 +42,7 @@ except ImportError:                       # older SDKs: nothing to silence
 
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
+from backtalk import signals
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
@@ -273,6 +274,7 @@ class WarmBrain:
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
+        think_buf = ""                 # summarized reasoning, logged never spoken
         async for msg in self._client.receive_response():
             t = type(msg).__name__
             if t == "StreamEvent":
@@ -290,7 +292,22 @@ class WarmBrain:
                                              buf[m.end():])
                             if sentence:
                                 yield sentence
+                    elif delta.get("type") == "thinking_delta":
+                        # Reasoning stream: accumulate, flush to the log AND
+                        # the transcript bus at block end. NEVER yielded —
+                        # the mouth only ever speaks text_delta, so this
+                        # stays screen-only, like the desktop app's verbose
+                        # transcript. On the bus it rides as its own
+                        # "thinking" role, distinct from user/assistant, so
+                        # a dashboard can dim it (or hide it).
+                        think_buf += delta.get("thinking", "")
                 elif ev.get("type") == "content_block_stop":
+                    if think_buf.strip():
+                        for ln in think_buf.strip().splitlines():
+                            if ln.strip():
+                                log(f"[think] {ln.strip()}")
+                        signals.transcript("thinking", think_buf.strip())
+                        think_buf = ""
                     # End of a speech block (e.g. right before a tool
                     # call): flush NOW. Without this, pre-tool filler
                     # ("On it — let me grab that.") sits silent in the
