@@ -96,6 +96,15 @@ class WarmBrain:
                 system_prompt={"type": "preset", "preset": "claude_code",
                                "append": DISCIPLINE},
                 include_partial_messages=True,
+                # Without an explicit thinking config the CLI defaults
+                # thinking.display to "omitted", so every transcript
+                # thinking block is stored as signature-only with empty
+                # text (SDK issue #831 — the caller has to opt in). The
+                # model reasons either way; "summarized" is what makes
+                # that reasoning readable, so nightly `dream` can scan a
+                # backtalk session's thinking, not just its spoken turns.
+                thinking={"type": "enabled", "budget_tokens": 4000,
+                          "display": "summarized"},
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
