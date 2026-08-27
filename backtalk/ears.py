@@ -30,11 +30,13 @@ import platform
 import re
 import sys
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
 import webrtcvad
 
+from backtalk import audio_bus
 from backtalk.config import CFG
 from backtalk.vlog import log
 
@@ -227,6 +229,31 @@ def transcribe(pcm: np.ndarray) -> str:
     return _NONSPEECH.sub("", text).strip()
 
 
+def _mic_frames(dev_fn):
+    """Yield mono int16 frames forever, transparently reopening the
+    InputStream when an idle device refresh (audio_bus) or a PortAudio
+    device error asks for it. Yields None once right after a reopen so the
+    caller can drop any half-captured utterance."""
+    while True:
+        if audio_bus.reinit_wanted():
+            audio_bus.park_mic()
+            while audio_bus.reinit_wanted():
+                time.sleep(0.05)
+            audio_bus.unpark_mic()
+            yield None
+        dev = dev_fn()
+        try:
+            with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
+                                blocksize=FRAME_LEN, device=dev,
+                                extra_settings=_wasapi_settings(dev)) as stream:
+                while not audio_bus.reinit_wanted():
+                    block, _ = stream.read(FRAME_LEN)
+                    yield block[:, 0].copy()
+        except sd.PortAudioError as e:
+            log(f"[ears] mic stream error, reopening: {e}")
+            audio_bus.request_reinit()
+
+
 class Ears:
     def __init__(self, aggressiveness: int = 2, silence_ms: int = 480):
         self.vad = webrtcvad.Vad(aggressiveness)
@@ -247,19 +274,19 @@ class Ears:
         in_utterance = False
         elapsed = 0.0
 
-        dev = _input_device()
-        with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                            blocksize=FRAME_LEN, device=dev,
-                            extra_settings=_wasapi_settings(dev)) \
-                as stream:
-            while True:
-                block, _ = stream.read(FRAME_LEN)
+        audio_bus.mic_listen_start()
+        try:
+            for mono in _mic_frames(_input_device):
+                if mono is None:            # mic just reopened after a refresh
+                    frames, ring = [], []
+                    in_utterance = False
+                    speech_run = silence_run = speech_total = 0
+                    continue
                 elapsed += FRAME_MS / 1000
                 if abort and abort():
                     return None
                 if timeout_s and elapsed > timeout_s and not in_utterance:
                     return None
-                mono = block[:, 0].copy()
                 if gate and gate():
                     # speakers are talking and barge-in isn't on: ignore
                     ring.clear()
@@ -291,6 +318,8 @@ class Ears:
                             speech_run = speech_total = 0
                             continue
                         return transcribe(np.concatenate(frames))
+        finally:
+            audio_bus.mic_listen_stop()
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
@@ -298,18 +327,22 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
     frames: list[np.ndarray] = []
-    dev = _input_device()
-    with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                        blocksize=FRAME_LEN, device=dev,
-                        extra_settings=_wasapi_settings(dev)) \
-            as stream:
-        while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
-            block, _ = stream.read(FRAME_LEN)
-            frames.append(block[:, 0].copy())
-        # a small tail so the last word isn't clipped at release
-        for _ in range(6):
-            block, _ = stream.read(FRAME_LEN)
-            frames.append(block[:, 0].copy())
+    audio_bus.ptt_capture_start()
+    try:
+        dev = _input_device()
+        with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
+                            blocksize=FRAME_LEN, device=dev,
+                            extra_settings=_wasapi_settings(dev)) \
+                as stream:
+            while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
+                block, _ = stream.read(FRAME_LEN)
+                frames.append(block[:, 0].copy())
+            # a small tail so the last word isn't clipped at release
+            for _ in range(6):
+                block, _ = stream.read(FRAME_LEN)
+                frames.append(block[:, 0].copy())
+    finally:
+        audio_bus.ptt_capture_end()
     if len(frames) * FRAME_MS / 1000 < min_s:
         return None
     return transcribe(np.concatenate(frames))

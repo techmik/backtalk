@@ -44,16 +44,20 @@ import queue
 import re
 import sys
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
 
+from backtalk import audio_bus
 from backtalk.config import CFG
 from backtalk.vlog import log
 
 KOKORO_RATE = 24000
 EL_RATE = 44100
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+
+_REFRESH = "__audio_refresh__"   # sentinel `directions` for an idle device-refresh task
 
 _pipe = None
 _pipe_lock = threading.Lock()
@@ -266,8 +270,12 @@ class Mouth:
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
+        self._last_active = time.monotonic()
+        self._idle_refreshed = True   # nothing to refresh before the first reply
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+        self._idle_watch_t = threading.Thread(target=self._idle_watch, daemon=True)
+        self._idle_watch_t.start()
 
     @property
     def speaking(self) -> bool:
@@ -319,6 +327,9 @@ class Mouth:
         while True:
             item = self._q.get()
             sentence, directions = item if isinstance(item, tuple) else (item, None)
+            if directions == _REFRESH:
+                self._idle_refresh()
+                continue
             if not sentence:
                 continue
             self._stop.clear()
@@ -334,6 +345,8 @@ class Mouth:
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
+                self._last_active = time.monotonic()
+                self._idle_refreshed = False
                 if self._q.empty():
                     self._speaking.clear()
                     # The reply has genuinely stopped talking, as opposed to
@@ -394,6 +407,47 @@ class Mouth:
             sd._initialize()
         except Exception as e:
             log(f"[mouth] PortAudio reinit failed: {e}")
+
+    def _idle_watch(self):
+        """Once the conversation has been quiet a while, queue a device
+        refresh so the NEXT reply lands on whatever the OS now calls the
+        default output. Catches a hot-plug the write path never errors on
+        (Bluetooth earbuds pulled from behind a USB dongle: the dongle,
+        and PortAudio's cached device table, still look live)."""
+        IDLE_S = 6.0
+        while True:
+            time.sleep(2.0)
+            if self._idle_refreshed:
+                continue
+            if not self._q.empty() or self._speaking.is_set():
+                continue
+            if audio_bus.ptt_active():
+                continue
+            if time.monotonic() - self._last_active < IDLE_S:
+                continue
+            self._idle_refreshed = True
+            self._q.put((None, _REFRESH))
+
+    def _idle_refresh(self):
+        """Worker-thread side of the idle refresh (sole owner of self._out).
+        Rebuild PortAudio, then eagerly reopen the output stream now, in the
+        silent gap, so the next reply starts warm -- no onset blip (audio
+        law #1)."""
+        if audio_bus.ptt_active():
+            self._idle_refreshed = False    # a press started; try again later
+            return
+        audio_bus.request_reinit()
+        if audio_bus.mic_listening():
+            audio_bus.wait_mic_parked(1.0)  # let hands-free listen_once park
+        prev_rate = self._out_rate
+        self._drop_out()
+        audio_bus.run_reinit()
+        audio_bus.unpark_mic()
+        try:
+            if prev_rate:
+                self._get_out(prev_rate)
+        except Exception as e:
+            log(f"[mouth] idle refresh reopen failed: {e}")
 
     def _play_stream(self, sentence: str, directions=None, block: int = 2205,
                      prebuffer_s: float = 0.75):
