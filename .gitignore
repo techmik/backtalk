@@ -6,6 +6,8 @@ logs/
 .voice_state
 .voice_waveform
 .voice_loading_pid
+.voice_direction
+.voice_reply_done
 .voice_transcript.jsonl
 .voice_inbox/
 uv.lock
