@@ -50,6 +50,65 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 
+def _squish(s, n) -> str:
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _tool_summary(name: str, inp: dict) -> str:
+    """One compact line describing a tool call, pushed to the transcript
+    bus so a dashboard can show WHAT the agent is doing, not just what
+    it's reasoning — the piece the desktop app's verbose view has that a
+    plain chat panel doesn't. Never raises."""
+    try:
+        n = name or "?"
+        inp = inp or {}
+        if n == "Bash":
+            return f"Bash: {_squish(inp.get('command', ''), 120)}"
+        if n in ("Read", "Edit", "Write", "NotebookEdit"):
+            p = str(inp.get("file_path") or inp.get("notebook_path") or "")
+            return f"{n} {os.path.basename(p) or p}"
+        if n == "Grep":
+            where = inp.get("path") or inp.get("glob") or ""
+            pat = _squish(inp.get("pattern", ""), 60)
+            return f'Grep "{pat}"' + (f" in {where}" if where else "")
+        if n == "Glob":
+            return f"Glob {_squish(inp.get('pattern', ''), 80)}"
+        if n in ("WebFetch", "WebSearch"):
+            return f"{n} {_squish(inp.get('url') or inp.get('query') or '', 100)}"
+        if n == "Task":
+            return f"Task: {_squish(inp.get('description') or inp.get('subagent_type') or '', 80)}"
+        if n == "TodoWrite":
+            return "TodoWrite"
+        for v in inp.values():
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                return f"{n} {_squish(v, 90)}"
+        return n
+    except Exception:
+        return name or "?"
+
+
+def _tool_result_text(block) -> str:
+    """Compact result string for the transcript bus (errors flagged).
+    Never raises."""
+    try:
+        content = getattr(block, "content", None)
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict):
+                    parts.append(str(c.get("text") or c.get("content") or ""))
+                else:
+                    parts.append(str(c))
+            text = " ".join(parts)
+        else:
+            text = str(content or "")
+        text = _squish(text, 200) or "(no output)"
+        return ("error: " if getattr(block, "is_error", False) else "") + text
+    except Exception:
+        return ""
+
+
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None,
                  resume_id: str | None = None):
@@ -104,8 +163,11 @@ class WarmBrain:
                 # model reasons either way; "summarized" is what makes
                 # that reasoning readable, so nightly `dream` can scan a
                 # backtalk session's thinking, not just its spoken turns.
-                thinking={"type": "enabled", "budget_tokens": 4000,
-                          "display": "summarized"},
+                # "adaptive" (not "enabled" + budget_tokens): the model
+                # paces its own reasoning depth per turn. budget_tokens is
+                # removed on Sonnet 5 / Opus 5 (400 on the raw API) —
+                # "adaptive" is the only on-mode; effort tunes depth.
+                thinking={"type": "adaptive", "display": "summarized"},
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
@@ -318,6 +380,25 @@ class WarmBrain:
                     buf = ""
                     if tail:
                         yield tail
+            elif t == "AssistantMessage":
+                # Tool calls: surface WHAT the agent does, not just its
+                # reasoning. Never yielded — transcript bus only, so a
+                # dashboard shows the activity like the desktop app's
+                # verbose view.
+                for b in getattr(msg, "content", []) or []:
+                    if type(b).__name__ in ("ToolUseBlock",
+                                            "ServerToolUseBlock"):
+                        line = _tool_summary(getattr(b, "name", "?"),
+                                             getattr(b, "input", {}))
+                        log(f"[tool] {line}")
+                        signals.transcript("tool", line)
+            elif t == "UserMessage":
+                for b in getattr(msg, "content", []) or []:
+                    if type(b).__name__ in ("ToolResultBlock",
+                                            "ServerToolResultBlock"):
+                        res = _tool_result_text(b)
+                        if res:
+                            signals.transcript("tool-result", res)
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)
