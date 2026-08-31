@@ -20,7 +20,9 @@
 The voice line leaves notes; faces read the notes. That one dumb trick
 is the whole integration surface:
 
-  .voice_state          idle | listening | thinking | speaking
+  .voice_state          idle | listening | thinking | working | speaking
+                        ("working" = a tool is actually running, as opposed
+                        to "thinking" = the model is reasoning)
   .voice_waveform       JSON {ts, samples: [64 floats]} while audio plays
   .voice_loading_pid    exists while the thinking sound is playing
   .voice_rate_limits    JSON {window: {utilization, resets_at}} — only

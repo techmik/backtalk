@@ -717,6 +717,10 @@ async def amain():
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
+    # So the mouth doesn't flash "idle" when a filler line finishes playing
+    # while a tool is still running under it -- brain._dirty is True from
+    # query() until the turn's ResultMessage.
+    mouth.turn_active = lambda: brain._dirty
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"

@@ -349,6 +349,12 @@ class Mouth:
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._last_active = time.monotonic()
         self._idle_refreshed = True   # nothing to refresh before the first reply
+        # Optional () -> bool set by main.py to brain._dirty. When the speech
+        # queue drains we normally stamp "idle" -- but a filler line ("on it,
+        # let me check") can finish playing while a tool is still running
+        # underneath it. If the turn is still live, leave the state alone
+        # (brain owns "working"/"thinking" then) instead of flashing idle.
+        self.turn_active = None
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
         self._idle_watch_t = threading.Thread(target=self._idle_watch, daemon=True)
@@ -430,7 +436,11 @@ class Mouth:
                     # the gap between two sentences of the same reply.
                     signals.reply_done()
                     self.ducker.speech_end()
-                    signals.set_state("idle")
+                    # ...but only settle to idle if the turn is actually done.
+                    # A tool still running under a filler line means the brain
+                    # owns the state ("working"/"thinking") right now.
+                    if not (self.turn_active and self.turn_active()):
+                        signals.set_state("idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the

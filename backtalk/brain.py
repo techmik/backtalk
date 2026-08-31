@@ -441,6 +441,10 @@ class WarmBrain:
                                              getattr(b, "input", {}))
                         log(f"[tool] {line}")
                         signals.transcript("tool", line)
+                        # A tool is actually running now -- a distinct state
+                        # from "thinking" so a face can show the turn isn't
+                        # done just because the model stopped composing text.
+                        signals.set_state("working")
             elif t == "UserMessage":
                 for b in getattr(msg, "content", []) or []:
                     if type(b).__name__ in ("ToolResultBlock",
@@ -448,6 +452,9 @@ class WarmBrain:
                         res = _tool_result_text(b)
                         if res:
                             signals.transcript("tool-result", res)
+                        # Tool done -- the model goes back to reasoning about
+                        # the result before it speaks or calls the next tool.
+                        signals.set_state("thinking")
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)
