@@ -30,13 +30,11 @@ import platform
 import re
 import sys
 import threading
-import time
 
 import numpy as np
 import sounddevice as sd
 import webrtcvad
 
-from backtalk import audio_bus
 from backtalk.config import CFG
 from backtalk.vlog import log
 
@@ -51,55 +49,6 @@ _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 _model = None
 _model_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
-_device = None           # device actually in use (post-fallback), faster-whisper only
-_warned_missing_device = False
-
-
-def _input_device():
-    """Resolve CFG["mic_device_name"] to a PortAudio input device index
-    via case-insensitive substring match. "" or no match -> None, which
-    means "let PortAudio use the OS default recording device" — the
-    same fallback voice-line uses, logged once rather than every call.
-
-    On Windows the same physical device is enumerated once per host API
-    (MME, DirectSound, WASAPI, WDM-KS); MME's name is truncated by
-    PortAudio's fixed-length buffer, which can make a plain first-match
-    land on the DirectSound copy. WASAPI is the modern shared-mode API
-    with the best resampling quality, so prefer it among matches."""
-    global _warned_missing_device
-    name = CFG.get("mic_device_name", "")
-    if not name:
-        return None
-    name_low = name.lower()
-    apis = sd.query_hostapis()
-    matches = [(i, d) for i, d in enumerate(sd.query_devices())
-               if d["max_input_channels"] > 0 and name_low in d["name"].lower()]
-    for i, d in matches:
-        if apis[d["hostapi"]]["name"] == "Windows WASAPI":
-            return i
-    if matches:
-        return matches[0][0]
-    if not _warned_missing_device:
-        log(f"[ears] mic_device_name {name!r} not found — "
-            f"using system default")
-        _warned_missing_device = True
-    return None
-
-
-def _wasapi_settings(device):
-    """WASAPI shared-mode streams reject any samplerate but the device's
-    own mix format unless auto-convert is explicitly requested — MME and
-    DirectSound resample for free, WASAPI doesn't. Returns a WasapiSettings
-    enabling it when `device` (or the OS default input when None) is on
-    WASAPI, else None. No-op on macOS/Linux, which have no such hostapi."""
-    try:
-        d = sd.query_devices(device) if device is not None \
-            else sd.query_devices(kind="input")
-    except Exception:
-        return None
-    if sd.query_hostapis()[d["hostapi"]]["name"] == "Windows WASAPI":
-        return sd.WasapiSettings(auto_convert=True)
-    return None
 
 
 def _apple_gpu_available() -> bool:
@@ -129,6 +78,186 @@ def _mlx_repo(model_name: str) -> str:
     return f"mlx-community/whisper-{model_name}-mlx"
 
 
+_mic_checked = False
+
+
+_mic_device_warned = False
+
+
+def _mic_index():
+    """Resolve mic_device (a device NAME) to an index, or None for the default.
+
+    A NAME and never an index, because indices shift every time a device
+    connects or disconnects, which is the exact event this setting exists
+    to survive. Measured on a real machine: plugging a USB microphone in
+    moved the default pair from [-1, 1] to [1, 3], silently changing the
+    OUTPUT device too.
+
+    Re-resolved on every stream open rather than cached at startup, for
+    the same reason. Exact name wins, then the first case-insensitive
+    substring, so a precise name can never be beaten by a loose one.
+    """
+    global _mic_device_warned
+    want = str(CFG.get("mic_device", "") or "").strip()
+    if not want:
+        return None
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        log(f"[ears] could not list audio devices ({e}) -- using the "
+            f"default mic")
+        return None
+    ins = [(i, d) for i, d in enumerate(devices)
+           if d.get("max_input_channels", 0) > 0]
+    for i, d in ins:
+        if d["name"] == want:
+            _mic_device_warned = False
+            return i
+    low = want.lower()
+    for i, d in ins:
+        if low in d["name"].lower():
+            _mic_device_warned = False
+            return i
+    if not _mic_device_warned:          # once per disappearance, not per press
+        _mic_device_warned = True
+        log(f"[ears] mic_device {want!r} not found -- using the system "
+            f"default. Inputs I can see: {[d['name'] for _, d in ins]}")
+    return None
+
+
+def _open_mic():
+    """Open the capture stream on the configured mic.
+
+    Degrades to the system default if that device will not open --
+    unplugged between the lookup and the open, busy, or refusing the
+    sample rate. The mic gets worse; it never goes mute.
+    """
+    dev = _mic_index()
+    opts = dict(samplerate=RATE, channels=1, dtype="int16",
+                blocksize=FRAME_LEN)
+    try:
+        return sd.InputStream(device=dev, **opts)
+    except Exception as e:
+        if dev is not None:
+            log(f"[ears] could not open mic_device {CFG.get('mic_device')!r} "
+                f"({e}) -- using the system default")
+            try:
+                return sd.InputStream(**opts)
+            except Exception:
+                pass                   # fall through to the rebuild below
+        return _reopen_after_device_change(opts)
+
+
+def _reopen_after_device_change(opts):
+    """Last resort: rebuild the audio system, then open the mic once more.
+
+    PortAudio caches the device list when it initialises, so a device that
+    disappears afterwards leaves a stale entry behind. A Bluetooth headset
+    flipping between listening and call modes does this every time the mic
+    opens, and from then on EVERY capture fails while the voice line looks
+    perfectly healthy and simply never hears another word.
+
+    Rebuilding refreshes the list. It also closes every open stream, the
+    speaking one included, which is why Mouth._get_out rebuilds a stream
+    it finds dead rather than trusting the one it is holding. Do not
+    remove that guard without removing this.
+    """
+    log("[ears] the audio devices changed -- rebuilding and reopening")
+    try:
+        sd._terminate()
+    except Exception:
+        pass                           # already down; re-initialising is the point
+    sd._initialize()
+    return sd.InputStream(**opts)
+
+
+_mic_warned = False
+
+# Substrings PortAudio uses when the problem is the DEVICE rather than the
+# audio. Matched on the message because the exception TYPE is the same
+# PortAudioError whether a device vanished or a stream merely glitched.
+_DEVICE_ERROR_HINTS = ("error querying device", "invalid device",
+                       "device unavailable", "no default input",
+                       "invalid number of channels", "device not found")
+
+
+def _mic_message(detail: str) -> list[str]:
+    """The one explanation, so startup and mid-session say the same thing."""
+    return [
+        "[ears] NO WORKING MICROPHONE. Nothing can be recorded on this "
+        "machine, so the talk key will have nothing to send.",
+        f"[ears] the audio system said: {detail}",
+        "[ears] plug one in and start the voice line again. If one IS "
+        "plugged in, check it is allowed in this system's microphone "
+        "privacy settings -- and if you have several, put part of the "
+        "one you want in \"mic_device\" in backtalk.json.",
+    ]
+
+
+def explain_audio_failure(exc) -> bool:
+    """Turn a device-level audio failure into plain words. Returns True
+    when it handled the message, so the caller can skip the raw repr.
+
+    The startup pre-flight cannot cover a microphone that is unplugged or
+    dies MID-SESSION, and that person gets the worst version of this:
+    no warning at all, and a raw PortAudioError on every single press,
+    forever. The key hook keeps working throughout, so it still looks
+    like it is listening. This says the same sentences the pre-flight
+    would have said, at the moment it becomes true.
+
+    Said in full once, then briefly, because a message repeated on every
+    key press stops being information and becomes noise.
+    """
+    global _mic_warned
+    text = str(exc).lower()
+    # THE TWO HALVES OF THIS TEST ARE NOT DOING THE SAME JOB. Do not
+    # simplify it to one. Measured on Windows: the SAME missing microphone
+    # produces "Error querying device -1" when it is absent at startup and
+    # "A device ID has been used that is out of range for your system
+    # [MME error 2]" when it is unplugged mid-stream. The second matches
+    # not one hint below, and was caught only by the type check -- on the
+    # very first real test of the case this function exists for. The
+    # hints catch device failures raised as something other than a
+    # PortAudioError; the type catches PortAudio wording nobody predicted.
+    if type(exc).__name__ != "PortAudioError" and \
+            not any(h in text for h in _DEVICE_ERROR_HINTS):
+        return False
+    if _mic_warned:
+        log("[ears] still no working microphone.")
+        return True
+    _mic_warned = True
+    for line in _mic_message(f"{type(exc).__name__}: {exc}"):
+        log(line)
+    return True
+
+
+def check_microphone() -> bool:
+    """Say whether recording is possible at all, BEFORE the greeting.
+
+    Without this the voice line boots on a machine with no microphone,
+    warms, speaks its greeting and presents a working push-to-talk
+    prompt. The key hook works perfectly throughout, so the user is
+    given every impression it is listening -- and the only sign of
+    trouble is a raw PortAudioError AFTER they have held the key and
+    spoken. It then repeats forever, because holding a key again cannot
+    conjure a device.
+    """
+    global _mic_checked
+    if _mic_checked:
+        return True
+    _mic_checked = True
+    try:
+        sd.check_input_settings(device=_mic_index(), channels=1,
+                                samplerate=RATE, dtype="int16")
+        return True
+    except Exception as e:
+        global _mic_warned
+        _mic_warned = True      # said it here; do not repeat on first press
+        for line in _mic_message(str(e)):
+            log(line)
+        return False
+
+
 def _add_nvidia_dll_dirs():
     """Windows only. pip-installed nvidia-cublas-cu12 / nvidia-cudnn-cu12 /
     nvidia-cuda-runtime-cu12 drop their DLLs under site-packages/nvidia/
@@ -138,7 +267,11 @@ def _add_nvidia_dll_dirs():
     loader doesn't use the LoadLibraryEx flags that respect it, and falls
     back to the plain PATH env var instead -- confirmed by testing both
     against this exact cublas64_12.dll-not-found failure. Without this,
-    CUDA fails at first inference even though the packages are installed."""
+    CUDA fails at first inference even though the packages are installed.
+
+    ibuy-custom: kept on top of upstream's _probe()-based CPU fallback --
+    _probe() catches a broken GPU early, this MAKES the GPU work so the
+    fallback never has to fire."""
     if sys.platform != "win32":
         return
     import importlib.util
@@ -154,28 +287,24 @@ def _add_nvidia_dll_dirs():
         os.environ["PATH"] = os.pathsep.join(dirs) + os.pathsep + os.environ["PATH"]
 
 
-def _load_faster_whisper(device: str, compute_type: str):
-    """Load faster-whisper on `device`, falling back to CPU on failure.
-    A missing/broken CUDA library can surface here at construction, or
-    only later on first real inference (see the try/except in
-    transcribe()) -- CTranslate2 doesn't touch cuBLAS until it actually
-    needs it."""
-    from faster_whisper import WhisperModel
-    log(f"[ears] loading {CFG['stt_model']} ({device}/{compute_type})...")
-    try:
-        return WhisperModel(CFG["stt_model"], device=device, compute_type=compute_type), device
-    except Exception:
-        if device == "cpu":
-            raise
-        log(f"[ears] failed to load Whisper on device={device} -- falling back to CPU")
-        return WhisperModel(CFG["stt_model"], device="cpu", compute_type="int8"), "cpu"
+def _probe(model):
+    """Run a tenth of a second of silence through the real path.
+
+    faster-whisper is lazy: transcribe() returns a generator and does no
+    work until it is iterated, so the list() is what actually exercises
+    the backend and is not redundant.
+    """
+    segments, _ = model.transcribe(np.zeros(RATE // 10, dtype=np.float32),
+                                   language="en")
+    list(segments)
 
 
 def warm():
     """Load the STT model (first call downloads it to the HF cache).
     Called at startup while the greeting plays, so the first real
     utterance doesn't pay the load."""
-    global _model, _backend, _device
+    global _model, _backend
+    check_microphone()
     with _model_lock:
         if _model is None:
             if _apple_gpu_available():
@@ -190,8 +319,36 @@ def warm():
                                        verbose=None)
                 _model, _backend = repo, "mlx"
             else:
+                from faster_whisper import WhisperModel
+                want = CFG["stt_device"]
+                log(f"[ears] loading {CFG['stt_model']} "
+                    f"({want}/{CFG['stt_compute']})...")
                 _add_nvidia_dll_dirs()
-                _model, _device = _load_faster_whisper(CFG["stt_device"], CFG["stt_compute"])
+                _model = WhisperModel(CFG["stt_model"], device=want,
+                                      compute_type=CFG["stt_compute"])
+                # PROVE the device before the greeting, not at the first
+                # spoken sentence. WhisperModel CONSTRUCTS perfectly well
+                # against a GPU it cannot actually use: "auto" picks CUDA
+                # on any NVIDIA machine, and the CUDA runtime is not
+                # loaded until the first inference. So warm-up logged
+                # "model ready", startup reported healthy, and a missing
+                # cublas DLL only surfaced when the user finally spoke --
+                # long after the greeting, in a place they could not
+                # connect to a setting. The Apple-GPU branch above has
+                # always done this; this one never did.
+                try:
+                    _probe(_model)
+                except Exception as e:
+                    if want == "cpu":
+                        raise
+                    log(f"[ears] {want!r} does not work on this machine "
+                        f"({type(e).__name__}: {e}).")
+                    log("[ears] falling back to the CPU. Set "
+                        "\"stt_device\": \"cpu\" in backtalk.json to skip "
+                        "this check in future.")
+                    _model = WhisperModel(CFG["stt_model"], device="cpu",
+                                          compute_type=CFG["stt_compute"])
+                    _probe(_model)
                 _backend = "faster-whisper"
             log(f"[ears] model ready ({_backend})")
     return _model
@@ -210,48 +367,9 @@ def transcribe(pcm: np.ndarray) -> str:
                                       temperature=0.0, language=lang,
                                       verbose=None)["text"].strip()
     else:
-        global _model, _device
-        try:
-            segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
-            text = "".join(s.text for s in segments).strip()
-        except Exception:
-            # segments is a lazy generator -- decoding (and so a CUDA
-            # failure) can happen during the join above, not during the
-            # transcribe() call, which is why this can't be caught in
-            # _load_faster_whisper alone.
-            if _device == "cpu":
-                raise
-            log(f"[ears] CUDA transcription failed on device={_device} -- reloading on CPU and retrying")
-            _model, _device = _load_faster_whisper("cpu", "int8")
-            model = _model
-            segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
-            text = "".join(s.text for s in segments).strip()
+        segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
+        text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
-
-
-def _mic_frames(dev_fn):
-    """Yield mono int16 frames forever, transparently reopening the
-    InputStream when an idle device refresh (audio_bus) or a PortAudio
-    device error asks for it. Yields None once right after a reopen so the
-    caller can drop any half-captured utterance."""
-    while True:
-        if audio_bus.reinit_wanted():
-            audio_bus.park_mic()
-            while audio_bus.reinit_wanted():
-                time.sleep(0.05)
-            audio_bus.unpark_mic()
-            yield None
-        dev = dev_fn()
-        try:
-            with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                                blocksize=FRAME_LEN, device=dev,
-                                extra_settings=_wasapi_settings(dev)) as stream:
-                while not audio_bus.reinit_wanted():
-                    block, _ = stream.read(FRAME_LEN)
-                    yield block[:, 0].copy()
-        except sd.PortAudioError as e:
-            log(f"[ears] mic stream error, reopening: {e}")
-            audio_bus.request_reinit()
 
 
 class Ears:
@@ -274,19 +392,15 @@ class Ears:
         in_utterance = False
         elapsed = 0.0
 
-        audio_bus.mic_listen_start()
-        try:
-            for mono in _mic_frames(_input_device):
-                if mono is None:            # mic just reopened after a refresh
-                    frames, ring = [], []
-                    in_utterance = False
-                    speech_run = silence_run = speech_total = 0
-                    continue
+        with _open_mic() as stream:
+            while True:
+                block, _ = stream.read(FRAME_LEN)
                 elapsed += FRAME_MS / 1000
                 if abort and abort():
                     return None
                 if timeout_s and elapsed > timeout_s and not in_utterance:
                     return None
+                mono = block[:, 0].copy()
                 if gate and gate():
                     # speakers are talking and barge-in isn't on: ignore
                     ring.clear()
@@ -318,8 +432,6 @@ class Ears:
                             speech_run = speech_total = 0
                             continue
                         return transcribe(np.concatenate(frames))
-        finally:
-            audio_bus.mic_listen_stop()
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
@@ -327,22 +439,14 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
     frames: list[np.ndarray] = []
-    audio_bus.ptt_capture_start()
-    try:
-        dev = _input_device()
-        with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                            blocksize=FRAME_LEN, device=dev,
-                            extra_settings=_wasapi_settings(dev)) \
-                as stream:
-            while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
-                block, _ = stream.read(FRAME_LEN)
-                frames.append(block[:, 0].copy())
-            # a small tail so the last word isn't clipped at release
-            for _ in range(6):
-                block, _ = stream.read(FRAME_LEN)
-                frames.append(block[:, 0].copy())
-    finally:
-        audio_bus.ptt_capture_end()
+    with _open_mic() as stream:
+        while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
+            block, _ = stream.read(FRAME_LEN)
+            frames.append(block[:, 0].copy())
+        # a small tail so the last word isn't clipped at release
+        for _ in range(6):
+            block, _ = stream.read(FRAME_LEN)
+            frames.append(block[:, 0].copy())
     if len(frames) * FRAME_MS / 1000 < min_s:
         return None
     return transcribe(np.concatenate(frames))

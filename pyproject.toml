@@ -22,14 +22,12 @@ dependencies = [
     "setuptools<81",
     "sounddevice>=0.5.0",
     "soundfile>=0.12.0",
-    # ibuy-custom: webrtcvad's sdist needs an MSVC C compiler to build on
-    # Windows (no wheels published upstream). webrtcvad-wheels is a
-    # community fork that ships prebuilt Windows wheels and installs as
-    # the same importable `webrtcvad` module -- confirmed identical API
-    # by testing `webrtcvad.Vad(2)` directly. Swapped here (not just
-    # installed ad hoc) so `uv sync` resolves it instead of trying to
-    # rebuild the broken original from source on every run.
-    "webrtcvad-wheels>=2.0.10",
+    # Windows has no compiler by default and upstream webrtcvad ships an
+    # sdist ONLY -- no wheels for any platform -- so uv tries to build it
+    # and dies demanding Visual C++ Build Tools. webrtcvad-wheels is the
+    # same code with binary wheels, importing as the identical module.
+    "webrtcvad>=2.0.10 ; sys_platform != 'win32'",
+    "webrtcvad-wheels>=2.0.10 ; sys_platform == 'win32'",
 ]
 
 [tool.setuptools]
