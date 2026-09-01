@@ -168,7 +168,17 @@ DEFAULTS = {
         # Purely for you. Voice IDs are unreadable six months later, so put
         # the human name here; nothing reads it.
         "voice_note": "",
+        # eleven_turbo_v2_5 is the proven default. Set this to
+        # eleven_v3_conversational to route through the Text to Dialogue
+        # API instead (Eleven v3 Conversational — more expressive, ~70ms
+        # slower to first audio; measured cost-neutral vs turbo). Any
+        # model id starting "eleven_v3" takes the dialogue path.
         "model": "eleven_turbo_v2_5",
+        # Voice stability, 0.0-1.0, used by both the turbo and the v3
+        # paths. Lower = wider emotional range and more variation between
+        # generations; higher = flatter, more consistent. 0.5 is the
+        # long-standing turbo value; ~0.3 suits eleven_v3_conversational.
+        "stability": 0.5,
         # Which OS credential-store entry holds the key. Change it if you
         # already keep an ElevenLabs key under a name of your own rather
         # than seeding a second copy of the same secret.

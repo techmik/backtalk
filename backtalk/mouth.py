@@ -200,7 +200,7 @@ def _stream_elevenlabs(text: str, timeout: float):
     THE ELEVENLABS DOCTRINE, learned the expensive way:
     - fetch mp3_44100_128 and decode locally (raw 44.1k PCM needs their
       Pro tier; the mp3 decode hides inside network wait anyway)
-    - turbo model, stability 0.5, similarity 0.75
+    - turbo model, stability from config (0.5 default), similarity 0.75
     - never the multilingual model for English, never style above 0 —
       both make delivery slow and dull
     - their site previews are MASTERED demo clips; raw API output never
@@ -228,8 +228,79 @@ def _stream_elevenlabs(text: str, timeout: float):
             with httpx.stream("POST", url, headers={"xi-api-key": key},
                               json={"text": text, "model_id": el["model"],
                                     "voice_settings": {
-                                        "stability": 0.5,
+                                        "stability": el.get("stability", 0.5),
                                         "similarity_boost": 0.75}},
+                              timeout=timeout) as r:
+                r.raise_for_status()
+                for chunk in r.iter_bytes(chunk_size=4096):
+                    proc.stdin.write(chunk)
+        except Exception as e:
+            feed_error.append(e)
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_feed, daemon=True)
+    t.start()
+    carry = b""
+    got_audio = False
+    while True:
+        data = proc.stdout.read(8820)
+        if not data:
+            break
+        data = carry + data
+        usable = len(data) - (len(data) % 2)
+        carry = data[usable:]
+        if usable:
+            got_audio = True
+            yield np.frombuffer(data[:usable], dtype=np.int16)
+    proc.wait(timeout=10)
+    if feed_error and not got_audio:
+        raise feed_error[0]
+
+
+def _stream_elevenlabs_v3(text: str, timeout: float):
+    """Eleven v3 Conversational via the Text to Dialogue REST stream ->
+    ffmpeg streaming decode -> int16 PCM at 44.1kHz.
+
+    Same transport as _stream_elevenlabs (httpx stream -> the ffmpeg
+    master chain -> PCM), but the v3 dialogue models are NOT served from
+    /text-to-speech, so the endpoint and body differ: inputs[] with a
+    per-line voice_id, model_id, and settings.stability only (no
+    similarity_boost, no style). synth_stream picks this when
+    elevenlabs.model starts with "eleven_v3". Kept as its own function so
+    the turbo path stays byte-for-byte untouched and this trial reverts
+    cleanly. A request caps at 2000 characters across all inputs; an
+    over-long chunk raises here and synth_stream degrades it to Kokoro."""
+    import subprocess
+
+    import httpx
+
+    if len(text) > 2000:
+        raise ValueError("dialogue request over the 2000-char limit")
+
+    el = CFG["elevenlabs"]
+    key = _get_elevenlabs_key()
+    url = ("https://api.elevenlabs.io/v1/text-to-dialogue/stream"
+           "?output_format=mp3_44100_128")
+    proc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
+         "-af", el["master"],
+         "-f", "s16le", "-ar", str(EL_RATE), "-ac", "1", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    feed_error: list = []
+
+    def _feed():
+        try:
+            with httpx.stream("POST", url, headers={"xi-api-key": key},
+                              json={"inputs": [{"text": text,
+                                                "voice_id": el["voice_id"]}],
+                                    "model_id": el["model"],
+                                    "settings": {
+                                        "stability": el.get("stability", 0.5)}},
                               timeout=timeout) as r:
                 r.raise_for_status()
                 for chunk in r.iter_bytes(chunk_size=4096):
@@ -321,8 +392,18 @@ def synth_stream(text: str, timeout: float = 30.0):
     renders. ElevenLabs when configured, Kokoro otherwise — and Kokoro
     as the fallback on ANY ElevenLabs failure. Degrade, never mute."""
     if _elevenlabs_ready():
+        import time
+        el = CFG["elevenlabs"]
+        v3 = str(el.get("model", "")).startswith("eleven_v3")
+        stream_fn = _stream_elevenlabs_v3 if v3 else _stream_elevenlabs
         try:
-            for pcm in _stream_elevenlabs(text, timeout):
+            t0 = time.perf_counter()
+            first = True
+            for pcm in stream_fn(text, timeout):
+                if first:
+                    log(f"[mouth] ttfa {'v3' if v3 else 'turbo'} "
+                        f"{(time.perf_counter() - t0) * 1000:.0f}ms")
+                    first = False
                 yield EL_RATE, pcm
             return
         except Exception as e:
