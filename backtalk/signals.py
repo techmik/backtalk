@@ -27,6 +27,8 @@ is the whole integration surface:
   .voice_loading_pid    exists while the thinking sound is playing
   .voice_rate_limits    JSON {window: {utilization, resets_at}} — only
                         written when show_usage is on
+  .voice_context        JSON {used, max, pct} — context-window fill after
+                        the latest turn (always written; not spend data)
   .voice_transcript.jsonl
                         append-only log, one JSON object per line:
                         {"ts": epoch, "role": "user"|"assistant", "text": ...}
@@ -68,6 +70,7 @@ _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _TRANSCRIPT_FILE = os.path.join(_DIR, ".voice_transcript.jsonl")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
+_CONTEXT_FILE = os.path.join(_DIR, ".voice_context")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -207,6 +210,23 @@ def set_rate_limit(window: str, utilization, resets_at):
         with open(_RATE_LIMIT_FILE, "w") as f:
             f.write(json.dumps(_rate_limits))
     except OSError:
+        pass
+
+
+def set_context(used_tokens, max_tokens, pct=None):
+    """How full the context window is after the latest turn — the number
+    the Claude Code desktop app shows as a ring under its input.
+
+    NOT gated by show_usage: unlike the rate-limit readout this is not
+    account spend, just how much of the conversation is in the window
+    before autocompact kicks in. Never raises."""
+    try:
+        if pct is None and max_tokens:
+            pct = round(100 * used_tokens / max_tokens, 1)
+        with open(_CONTEXT_FILE, "w") as f:
+            f.write(json.dumps({"used": used_tokens, "max": max_tokens,
+                                "pct": pct}))
+    except (OSError, TypeError, ZeroDivisionError):
         pass
 
 

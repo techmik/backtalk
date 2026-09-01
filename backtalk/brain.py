@@ -308,6 +308,23 @@ class WarmBrain:
         except Exception:
             pass
 
+    async def _publish_context(self):
+        """Publish context-window fill to the bus after a turn, so a
+        dashboard can show it in its status row like the desktop app's
+        context ring. Bounded and swallowed like _pull_rate_limits — it
+        must never cost a turn. Unlike the rate-limit readout this is not
+        gated: it is not account spend, only how full the window is."""
+        try:
+            cu = await asyncio.wait_for(self.context_usage(), 5)
+            if not cu:
+                return
+            used = int(cu.get("totalTokens") or 0)
+            total = int(cu.get("maxTokens") or cu.get("rawMaxTokens") or 0)
+            if used or total:
+                signals.set_context(used, total, cu.get("percentage"))
+        except Exception:
+            pass
+
     async def command(self, cmd: str) -> str:
         """Run a console slash command (/clear, /compact, /model,
         /effort) through the normal stream and return whatever text the
@@ -340,6 +357,9 @@ class WarmBrain:
         except asyncio.TimeoutError:
             log(f"[brain] console command timed out: {cmd!r}")
             return "error: the command timed out"
+        # /clear and /compact move the context floor a lot — refresh the
+        # readout now rather than waiting for the next spoken turn.
+        await self._publish_context()
         return " ".join(texts).strip()
 
     async def interrupt(self):
@@ -487,6 +507,7 @@ class WarmBrain:
                 self._tally(msg)
                 self._remember_session(msg)
                 await self._pull_rate_limits()
+                await self._publish_context()
                 break
         tail = buf.strip()
         if tail:
