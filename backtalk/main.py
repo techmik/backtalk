@@ -676,10 +676,18 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
             mouth.say_chunk(" ".join(batch), pending)
             pending = []
         if first:
-            # Zero sentences yielded (brain error / empty turn): nothing
-            # will ever dequeue, so nothing resets the bus — park it here.
-            signals.static_stop()
-            signals.set_state("idle")
+            if getattr(brain, "_turn_had_code", False):
+                # The turn was all fenced code — it rendered on the face
+                # but nothing was spoken. Say one short line so it isn't
+                # silent dead air; this also queues a chunk, so the bus
+                # resets through the normal speaking path.
+                emit("Code's on screen.")
+            else:
+                # Zero sentences yielded (brain error / empty turn):
+                # nothing will ever dequeue, so nothing resets the bus —
+                # park it here.
+                signals.static_stop()
+                signals.set_state("idle")
     except asyncio.CancelledError:
         try:
             await brain.interrupt()

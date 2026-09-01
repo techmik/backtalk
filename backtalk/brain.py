@@ -69,6 +69,117 @@ def _drain_think(buf: str):
     return out, buf
 
 
+class _StreamSplitter:
+    """Split a streamed text reply into spoken prose and fenced code.
+
+    DISCIPLINE now lets the agent wrap code/config snippets in a
+    ```` ``` ```` fence. Those must render on screen but never reach the
+    mouth. feed() takes raw text_delta chunks and returns a list of
+    complete prose sentences to speak; a fenced block (a line that
+    strips to ```` ``` ```` opens it, the next such line closes it) is
+    collected aside and handed to on_code the instant its closing fence
+    lands, tagged for the transcript bus only.
+
+    flush() forces out a trailing partial sentence at a block boundary
+    (e.g. right before a tool call) without touching fence state.
+    close() does the same at stream end and also releases an
+    unterminated fence. `had_code` is True once any block was emitted
+    this turn -- the caller uses it to decide whether a turn that spoke
+    nothing still needs one "code's on screen" line so the face isn't
+    silent."""
+
+    def __init__(self, on_code):
+        self._on_code = on_code
+        self._raw = ""        # unprocessed text (may end mid-line)
+        self._prose = ""      # prose awaiting sentence extraction
+        self._code = ""       # body of the fence currently open
+        self._in_fence = False
+        self.had_code = False
+
+    def feed(self, text):
+        self._raw += text
+        return self._pump(final=False, force_prose=False)
+
+    def flush(self):
+        return self._pump(final=False, force_prose=True)
+
+    def close(self):
+        return self._pump(final=True, force_prose=True)
+
+    def _pump(self, final, force_prose):
+        out = []
+        while True:
+            nl = self._raw.find("\n")
+            if nl >= 0:
+                line, self._raw = self._raw[:nl + 1], self._raw[nl + 1:]
+            elif final and self._raw:
+                line, self._raw = self._raw, ""
+            else:
+                break
+            if line.strip().startswith("```"):
+                if self._in_fence:
+                    self._flush_code()
+                    self._in_fence = False
+                else:
+                    out += self._drain_prose(force=True)
+                    self._in_fence = True
+                    self._code = ""
+                continue
+            if self._in_fence:
+                self._code += line
+            else:
+                self._prose += line
+                out += self._drain_prose(force=False)
+        # whatever is left has no newline yet
+        tail = self._raw
+        if self._in_fence:
+            if final:
+                # stream ended inside a fence -- release what we have
+                self._code += tail
+                self._raw = ""
+                self._flush_code()
+                self._in_fence = False
+            # else: code is not time-sensitive; keep the partial line
+            # buffered so a closing fence split across deltas is spotted
+        elif tail and not tail.lstrip().startswith("`"):
+            # a partial line that cannot be a fence marker is safe to
+            # speak now -- keeps the fast first-sentence start
+            self._prose += tail
+            self._raw = ""
+            out += self._drain_prose(force=force_prose)
+        elif final and tail:
+            # stream ended on a line that looked like a fence but never
+            # completed -- it was only prose
+            self._prose += tail
+            self._raw = ""
+            out += self._drain_prose(force=True)
+        elif force_prose:
+            out += self._drain_prose(force=True)
+        return out
+
+    def _drain_prose(self, force):
+        out = []
+        while True:
+            m = _SENTENCE_END.search(self._prose)
+            if not m:
+                break
+            s = self._prose[:m.end()].strip()
+            self._prose = self._prose[m.end():]
+            if s:
+                out.append(s)
+        if force and self._prose.strip():
+            out.append(self._prose.strip())
+            self._prose = ""
+        return out
+
+    def _flush_code(self):
+        block = self._code.strip("\n")
+        self._code = ""
+        if block.strip():
+            self.had_code = True
+            self._on_code(block)
+
+
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 
@@ -155,6 +266,10 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # Set per turn by ask_stream: did this turn emit a fenced code
+        # block? main.speak_reply reads it to cover a turn that rendered
+        # code but spoke nothing.
+        self._turn_had_code = False
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -424,8 +539,15 @@ class WarmBrain:
         """Yield complete sentences as they stream out of the model."""
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
-        buf = ""
         think_buf = ""                 # summarized reasoning, logged never spoken
+
+        def _emit_code(block):
+            log(f"[code] block ({len(block)} chars) -> screen only")
+            signals.transcript("code", block)
+            self._turn_had_code = True
+
+        split = _StreamSplitter(_emit_code)
+        self._turn_had_code = False
         async for msg in self._client.receive_response():
             t = type(msg).__name__
             if t == "StreamEvent":
@@ -433,16 +555,10 @@ class WarmBrain:
                 if ev.get("type") == "content_block_delta":
                     delta = ev.get("delta", {}) or {}
                     if delta.get("type") == "text_delta":
-                        buf += delta.get("text", "")
-                        # emit any complete sentences
-                        while True:
-                            m = _SENTENCE_END.search(buf)
-                            if not m:
-                                break
-                            sentence, buf = (buf[:m.end()].strip(),
-                                             buf[m.end():])
-                            if sentence:
-                                yield sentence
+                        # fence-aware: prose streams out to be spoken,
+                        # fenced code is siphoned to the transcript bus
+                        for sentence in split.feed(delta.get("text", "")):
+                            yield sentence
                     elif delta.get("type") == "thinking_delta":
                         # Reasoning stream: flush to the log AND the
                         # transcript bus AS IT FORMS (newline- or
@@ -471,10 +587,8 @@ class WarmBrain:
                     # ("On it — let me grab that.") sits silent in the
                     # buffer through the whole tool run, then plays
                     # glued to the answer: long dead air, then two
-                    # thoughts at once.
-                    tail = buf.strip()
-                    buf = ""
-                    if tail:
+                    # thoughts at once. Fence state is left intact.
+                    for tail in split.flush():
                         yield tail
             elif t == "AssistantMessage":
                 # Tool calls: surface WHAT the agent does, not just its
@@ -509,8 +623,7 @@ class WarmBrain:
                 await self._pull_rate_limits()
                 await self._publish_context()
                 break
-        tail = buf.strip()
-        if tail:
+        for tail in split.close():
             yield tail
 
 

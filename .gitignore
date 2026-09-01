@@ -23,3 +23,6 @@ show.json
 .python-version
 # Config backups the setup wizard leaves behind.
 *.json.*.bak
+# Local-only tests for this fork's custom changes -- upstream ships none and
+# there's no runner wired up, so these stay off the tree.
+test_*.py
