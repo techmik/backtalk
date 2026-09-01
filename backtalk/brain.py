@@ -47,6 +47,26 @@ from backtalk.vlog import log
 from backtalk import signals
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+# Thinking flushes to the transcript bus on a newline OR a sentence end,
+# so a long reasoning pause streams to a dashboard as it forms instead of
+# landing in one lump at block end (glued to the first spoken sentence).
+_THINK_FLUSH = re.compile(r"\n|(?<=[.!?])[ \t]")
+
+
+def _drain_think(buf: str):
+    """Pull every complete thinking segment (newline- or sentence-
+    terminated) off the front of buf, returning (segments, remainder).
+    The trailing partial stays buffered for the next delta. Keeps
+    reasoning streaming live rather than in one block-end lump."""
+    out = []
+    while True:
+        m = _THINK_FLUSH.search(buf)
+        if not m:
+            break
+        seg, buf = buf[:m.end()].strip(), buf[m.end():]
+        if seg:
+            out.append(seg)
+    return out, buf
 
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
@@ -404,20 +424,27 @@ class WarmBrain:
                             if sentence:
                                 yield sentence
                     elif delta.get("type") == "thinking_delta":
-                        # Reasoning stream: accumulate, flush to the log AND
-                        # the transcript bus at block end. NEVER yielded —
-                        # the mouth only ever speaks text_delta, so this
+                        # Reasoning stream: flush to the log AND the
+                        # transcript bus AS IT FORMS (newline- or
+                        # sentence-terminated segments), not in one lump at
+                        # block end — a 12s reasoning pause otherwise shows
+                        # nothing on screen then dumps the whole summary
+                        # glued to the first spoken sentence. NEVER yielded
+                        # — the mouth only ever speaks text_delta, so this
                         # stays screen-only, like the desktop app's verbose
                         # transcript. On the bus it rides as its own
                         # "thinking" role, distinct from user/assistant, so
                         # a dashboard can dim it (or hide it).
                         think_buf += delta.get("thinking", "")
+                        segs, think_buf = _drain_think(think_buf)
+                        for seg in segs:
+                            log(f"[think] {seg}")
+                            signals.transcript("thinking", seg)
                 elif ev.get("type") == "content_block_stop":
                     if think_buf.strip():
-                        for ln in think_buf.strip().splitlines():
-                            if ln.strip():
-                                log(f"[think] {ln.strip()}")
-                        signals.transcript("thinking", think_buf.strip())
+                        seg = think_buf.strip()
+                        log(f"[think] {seg}")
+                        signals.transcript("thinking", seg)
                         think_buf = ""
                     # End of a speech block (e.g. right before a tool
                     # call): flush NOW. Without this, pre-tool filler
