@@ -29,6 +29,13 @@ is the whole integration surface:
                         written when show_usage is on
   .voice_context        JSON {used, max, pct} — context-window fill after
                         the latest turn (always written; not spend data)
+  .voice_permission     JSON {ts, id, tool, what, detail} — present ONLY
+                        while a permission ask is waiting for an answer.
+                        Removed the instant the ask resolves (any path:
+                        voice, typed, a dashboard button, timeout, or an
+                        interrupt). A face can draw an approve/deny card
+                        off this; the answer rides the normal .voice_inbox/
+                        seam ("yes" / "no" / "details"), same as typing.
   .voice_transcript.jsonl
                         append-only log, one JSON object per line:
                         {"ts": epoch, "role": "user"|"assistant", "text": ...}
@@ -71,6 +78,7 @@ _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _TRANSCRIPT_FILE = os.path.join(_DIR, ".voice_transcript.jsonl")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _CONTEXT_FILE = os.path.join(_DIR, ".voice_context")
+_PERMISSION_FILE = os.path.join(_DIR, ".voice_permission")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -227,6 +235,37 @@ def set_context(used_tokens, max_tokens, pct=None):
             f.write(json.dumps({"used": used_tokens, "max": max_tokens,
                                 "pct": pct}))
     except (OSError, TypeError, ZeroDivisionError):
+        pass
+
+
+def permission_prompt(payload: dict):
+    """A permission ask is now waiting for an answer — publish it so a
+    face can draw an approve/deny card.
+
+    `payload` carries the same strings the gate just spoke: `id` (a token
+    that changes per ask, so a watcher can tell a new ask from a redraw),
+    `tool`, `what` (the short plain-words form), and `detail` (the full
+    literal form, shown when the person asks for "details"). The answer
+    does NOT come back here — it rides .voice_inbox/ like typed input
+    ("yes" / "no" / "details"). Cleared by permission_clear() the moment
+    the ask resolves, on every path. Never raises."""
+    try:
+        body = {"ts": time.time()}
+        body.update(payload or {})
+        with open(_PERMISSION_FILE, "w", encoding="utf-8") as f:
+            f.write(json.dumps(body))
+    except OSError:
+        pass
+
+
+def permission_clear():
+    """No permission ask is outstanding — remove the card. Called on
+    every gate exit (approve, deny, timeout, interrupt) and once at
+    startup to clear a card orphaned by a session that died mid-ask.
+    Never raises."""
+    try:
+        os.remove(_PERMISSION_FILE)
+    except OSError:
         pass
 
 

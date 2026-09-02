@@ -234,6 +234,13 @@ def make_permission_gate(mouth):
             ask += (" And any time you're done with these checks, say "
                     "stop asking for permission.")
         mouth.say(ask)
+        # publish the ask so a face can draw an approve/deny card. The
+        # answer still rides .voice_inbox/ ("yes"/"no"/"details") — a
+        # button just drops the same word a person would type.
+        perm_id = str(time.time_ns())
+        signals.permission_prompt({"id": perm_id, "tool": tool,
+                                   "what": what, "detail": detail,
+                                   "phase": "ask"})
         answer = None
         try:
             deadline = loop.time() + PERM_TIMEOUT_S
@@ -268,11 +275,15 @@ def make_permission_gate(mouth):
                     log("[perm]   details requested")
                     mouth.say(f"The details: I want to {detail}. "
                               "Yes or no?")
+                    signals.permission_prompt({"id": perm_id, "tool": tool,
+                                               "what": what, "detail": detail,
+                                               "phase": "detail"})
                     deadline = loop.time() + PERM_TIMEOUT_S
                     continue
                 answer = got
         finally:
             _PERM["fut"] = None
+            signals.permission_clear()   # covers every exit path
         if answer == _INTERRUPT_ANSWER:
             log("[perm]   turn interrupted, denied silently")
             return PermissionResultDeny(
@@ -782,6 +793,7 @@ async def amain():
 
     speak_task: asyncio.Task | None = None
     signals.transcript_reset()
+    signals.permission_clear()   # drop a card orphaned by a prior crash
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     threading.Thread(target=_inbox_reader, args=(typed_q,), daemon=True).start()
