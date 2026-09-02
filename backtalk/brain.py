@@ -52,6 +52,21 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 # landing in one lump at block end (glued to the first spoken sentence).
 _THINK_FLUSH = re.compile(r"\n|(?<=[.!?])[ \t]")
 
+# A "sentence" the mouth must never speak because it is really a pasted
+# block, not speech. Two triggers: a filesystem-path-like token (two or
+# more segments joined by "/" or "\"), or a length no spoken sentence
+# reaches. One bare filename ("check ears.py") stays speakable; a path,
+# a URL, or a wall of them does not. This is the mechanical backstop for
+# when the model ignores DISCIPLINE's "never speak a file path" and
+# narrates a file dump -- such lines are rerouted to the screen-only
+# code role by _StreamSplitter._route_prose.
+_PATHLIKE = re.compile(r"[^\s/\\]+[/\\][^\s/\\]+[/\\][^\s]*")
+_UNSPEAKABLE_LEN = 400
+
+
+def _looks_unspeakable(s: str) -> bool:
+    return len(s) > _UNSPEAKABLE_LEN or bool(_PATHLIKE.search(s))
+
 
 def _drain_think(buf: str):
     """Pull every complete thinking segment (newline- or sentence-
@@ -166,11 +181,22 @@ class _StreamSplitter:
             s = self._prose[:m.end()].strip()
             self._prose = self._prose[m.end():]
             if s:
-                out.append(s)
+                self._route_prose(s, out)
         if force and self._prose.strip():
-            out.append(self._prose.strip())
+            self._route_prose(self._prose.strip(), out)
             self._prose = ""
         return out
+
+    def _route_prose(self, s, out):
+        """Speak s -- unless it is really a pasted block (a file path, a
+        URL, a wall of text), in which case send it to the screen-only
+        code role instead. Backstop for a model that ignores DISCIPLINE
+        and narrates a file dump line by line."""
+        if _looks_unspeakable(s):
+            self.had_code = True
+            self._on_code(s)
+        else:
+            out.append(s)
 
     def _flush_code(self):
         block = self._code.strip("\n")
