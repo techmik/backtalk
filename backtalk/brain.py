@@ -335,6 +335,15 @@ class WarmBrain:
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
+                # The SDK frames the CLI's NDJSON one line per message and
+                # aborts the whole stream ("Fatal error in message reader")
+                # if any single line exceeds this. Default is 1 MB, which a
+                # single attached photo blows straight through once Read
+                # base64-encodes it into a tool_result. 50 MB clears one
+                # max-size (~25 MB) /attach file with margin; the rare turn
+                # that still overruns (several big images at once) is caught
+                # by ask_stream's recovery path instead of bricking.
+                max_buffer_size=50 * 1024 * 1024,
                 resume=rid,
             )
         if resume:
@@ -561,10 +570,39 @@ class WarmBrain:
             await self._client.disconnect()
             self._client = None
 
+    async def _recover(self, reason: str):
+        """A dead SDK client — transport crash mid-turn, most often a big
+        tool result (an image Read, base64-encoded) overrunning the NDJSON
+        line buffer — must not sit dead for the rest of the session. Tear
+        it down and reconnect (resuming the last completed turn when one
+        was saved, fresh otherwise), then speak one line so the turn isn't
+        silent. Anything said since the last completed turn is lost — a
+        working session beats a bricked one."""
+        log(f"[brain] recovering ({reason})")
+        self._dirty = False
+        try:
+            await self._client.disconnect()
+        except Exception:
+            pass
+        self._client = None
+        try:
+            if CFG.get("resume_last_session"):
+                try:
+                    sid = open(SESSION_FILE).read().strip()
+                except OSError:
+                    sid = ""
+                self._resume_id = sid or None
+            await self.start()
+            yield ("Sorry — something you sent was too big and it dropped "
+                   "my connection. I'm back now. Ask me again.")
+        except Exception as e:
+            log(f"[brain] recovery failed: {e!r}")
+            yield ("I lost my connection and couldn't get it back. "
+                   "Restart me when you get a chance.")
+
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
         self._dirty = True             # in flight until its ResultMessage
-        await self._client.query(utterance)
         think_buf = ""                 # summarized reasoning, logged never spoken
 
         def _emit_code(block):
@@ -574,81 +612,98 @@ class WarmBrain:
 
         split = _StreamSplitter(_emit_code)
         self._turn_had_code = False
-        async for msg in self._client.receive_response():
-            t = type(msg).__name__
-            if t == "StreamEvent":
-                ev = getattr(msg, "event", {}) or {}
-                if ev.get("type") == "content_block_delta":
-                    delta = ev.get("delta", {}) or {}
-                    if delta.get("type") == "text_delta":
-                        # fence-aware: prose streams out to be spoken,
-                        # fenced code is siphoned to the transcript bus
-                        for sentence in split.feed(delta.get("text", "")):
-                            yield sentence
-                    elif delta.get("type") == "thinking_delta":
-                        # Reasoning stream: flush to the log AND the
-                        # transcript bus AS IT FORMS (newline- or
-                        # sentence-terminated segments), not in one lump at
-                        # block end — a 12s reasoning pause otherwise shows
-                        # nothing on screen then dumps the whole summary
-                        # glued to the first spoken sentence. NEVER yielded
-                        # — the mouth only ever speaks text_delta, so this
-                        # stays screen-only, like the desktop app's verbose
-                        # transcript. On the bus it rides as its own
-                        # "thinking" role, distinct from user/assistant, so
-                        # a dashboard can dim it (or hide it).
-                        think_buf += delta.get("thinking", "")
-                        segs, think_buf = _drain_think(think_buf)
-                        for seg in segs:
+        try:
+            await self._client.query(utterance)
+            async for msg in self._client.receive_response():
+                t = type(msg).__name__
+                if t == "StreamEvent":
+                    ev = getattr(msg, "event", {}) or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "text_delta":
+                            # fence-aware: prose streams out to be spoken,
+                            # fenced code is siphoned to the transcript bus
+                            for sentence in split.feed(delta.get("text", "")):
+                                yield sentence
+                        elif delta.get("type") == "thinking_delta":
+                            # Reasoning stream: flush to the log AND the
+                            # transcript bus AS IT FORMS (newline- or
+                            # sentence-terminated segments), not in one lump
+                            # at block end — a 12s reasoning pause otherwise
+                            # shows nothing on screen then dumps the whole
+                            # summary glued to the first spoken sentence.
+                            # NEVER yielded — the mouth only ever speaks
+                            # text_delta, so this stays screen-only, like the
+                            # desktop app's verbose transcript. On the bus it
+                            # rides as its own "thinking" role, distinct from
+                            # user/assistant, so a dashboard can dim it.
+                            think_buf += delta.get("thinking", "")
+                            segs, think_buf = _drain_think(think_buf)
+                            for seg in segs:
+                                log(f"[think] {seg}")
+                                signals.transcript("thinking", seg)
+                    elif ev.get("type") == "content_block_stop":
+                        if think_buf.strip():
+                            seg = think_buf.strip()
                             log(f"[think] {seg}")
                             signals.transcript("thinking", seg)
-                elif ev.get("type") == "content_block_stop":
-                    if think_buf.strip():
-                        seg = think_buf.strip()
-                        log(f"[think] {seg}")
-                        signals.transcript("thinking", seg)
-                        think_buf = ""
-                    # End of a speech block (e.g. right before a tool
-                    # call): flush NOW. Without this, pre-tool filler
-                    # ("On it — let me grab that.") sits silent in the
-                    # buffer through the whole tool run, then plays
-                    # glued to the answer: long dead air, then two
-                    # thoughts at once. Fence state is left intact.
-                    for tail in split.flush():
-                        yield tail
-            elif t == "AssistantMessage":
-                # Tool calls: surface WHAT the agent does, not just its
-                # reasoning. Never yielded — transcript bus only, so a
-                # dashboard shows the activity like the desktop app's
-                # verbose view.
-                for b in getattr(msg, "content", []) or []:
-                    if type(b).__name__ in ("ToolUseBlock",
-                                            "ServerToolUseBlock"):
-                        line = _tool_summary(getattr(b, "name", "?"),
-                                             getattr(b, "input", {}))
-                        log(f"[tool] {line}")
-                        signals.transcript("tool", line)
-                        # A tool is actually running now -- a distinct state
-                        # from "thinking" so a face can show the turn isn't
-                        # done just because the model stopped composing text.
-                        signals.set_state("working")
-            elif t == "UserMessage":
-                for b in getattr(msg, "content", []) or []:
-                    if type(b).__name__ in ("ToolResultBlock",
-                                            "ServerToolResultBlock"):
-                        res = _tool_result_text(b)
-                        if res:
-                            signals.transcript("tool-result", res)
-                        # Tool done -- the model goes back to reasoning about
-                        # the result before it speaks or calls the next tool.
-                        signals.set_state("thinking")
-            elif t == "ResultMessage":
-                self._dirty = False    # turn fully consumed — pipe aligned
-                self._tally(msg)
-                self._remember_session(msg)
-                await self._pull_rate_limits()
-                await self._publish_context()
-                break
+                            think_buf = ""
+                        # End of a speech block (e.g. right before a tool
+                        # call): flush NOW. Without this, pre-tool filler
+                        # ("On it — let me grab that.") sits silent in the
+                        # buffer through the whole tool run, then plays
+                        # glued to the answer: long dead air, then two
+                        # thoughts at once. Fence state is left intact.
+                        for tail in split.flush():
+                            yield tail
+                elif t == "AssistantMessage":
+                    # Tool calls: surface WHAT the agent does, not just its
+                    # reasoning. Never yielded — transcript bus only, so a
+                    # dashboard shows the activity like the desktop app's
+                    # verbose view.
+                    for b in getattr(msg, "content", []) or []:
+                        if type(b).__name__ in ("ToolUseBlock",
+                                                "ServerToolUseBlock"):
+                            line = _tool_summary(getattr(b, "name", "?"),
+                                                 getattr(b, "input", {}))
+                            log(f"[tool] {line}")
+                            signals.transcript("tool", line)
+                            # A tool is actually running now -- a distinct
+                            # state from "thinking" so a face can show the
+                            # turn isn't done just because the model stopped
+                            # composing text.
+                            signals.set_state("working")
+                elif t == "UserMessage":
+                    for b in getattr(msg, "content", []) or []:
+                        if type(b).__name__ in ("ToolResultBlock",
+                                                "ServerToolResultBlock"):
+                            res = _tool_result_text(b)
+                            if res:
+                                signals.transcript("tool-result", res)
+                            # Tool done -- the model goes back to reasoning
+                            # about the result before it speaks or calls the
+                            # next tool.
+                            signals.set_state("thinking")
+                elif t == "ResultMessage":
+                    self._dirty = False   # turn fully consumed — pipe aligned
+                    self._tally(msg)
+                    self._remember_session(msg)
+                    await self._pull_rate_limits()
+                    await self._publish_context()
+                    break
+        except GeneratorExit:
+            raise
+        except Exception as e:
+            # SDK transport died mid-turn — most often CLIJSONDecodeError,
+            # a tool result (an image Read, base64-encoded) overrunning
+            # max_buffer_size. Flush whatever prose we have, rebuild the
+            # client so the NEXT turn works, and say what happened.
+            log(f"[brain] stream died: {type(e).__name__}: {str(e)[:160]}")
+            for tail in split.flush():
+                yield tail
+            async for line in self._recover(type(e).__name__):
+                yield line
+            return
         for tail in split.close():
             yield tail
 
