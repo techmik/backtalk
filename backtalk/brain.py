@@ -61,11 +61,17 @@ _THINK_FLUSH = re.compile(r"\n|(?<=[.!?])[ \t]")
 # narrates a file dump -- such lines are rerouted to the screen-only
 # code role by _StreamSplitter._route_prose.
 _PATHLIKE = re.compile(r"[^\s/\\]+[/\\][^\s/\\]+[/\\][^\s]*")
+# A "path" made only of digits and separators is a date ("9/22/2026") or a
+# ratio ("24/7/365"), which the model is right to speak. Found 2026-09-04:
+# the daily spoken recap's calendar line was being diverted to the screen.
+_NUMERIC_PATH = re.compile(r"[\d.,/\\]+")
 _UNSPEAKABLE_LEN = 400
 
 
 def _looks_unspeakable(s: str) -> bool:
-    return len(s) > _UNSPEAKABLE_LEN or bool(_PATHLIKE.search(s))
+    if len(s) > _UNSPEAKABLE_LEN:
+        return True
+    return any(not _NUMERIC_PATH.fullmatch(m) for m in _PATHLIKE.findall(s))
 
 
 def _drain_think(buf: str):

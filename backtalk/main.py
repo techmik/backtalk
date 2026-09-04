@@ -72,6 +72,11 @@ from backtalk.vlog import log
 
 NAME = CFG["name"]
 QUIT_PHRASES = CFG["quit_phrases"]
+# Set once the launcher/quit path wants the blocking executor jobs (the typed
+# reader, the talk-key wait) to return, so asyncio.run() can actually finish
+# joining them. Without it the process printed "hung up" and then sat forever
+# (upstream issue #24).
+_STOP = threading.Event()
 
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
 # When the agent wants a gated tool, the SDK routes the decision here:
@@ -131,6 +136,17 @@ def _norm_speech(text):
     for ch in text.lower():
         out.append(ch if "a" <= ch <= "z" else " ")
     return " ".join("".join(out).split())
+
+
+# Quit is an EXACT normalized match at every site, never a substring of the
+# raw transcript: "Goodbye, Jarvis." (Whisper's vocative comma) must quit,
+# and "No! Don't hang up, skip it" must stay a deny reason. Two of the three
+# sites tested raw text.lower() until 2026-09-04 (upstream issue #23).
+_QUIT_NORM = {_norm_speech(q) for q in QUIT_PHRASES}
+
+
+def _is_quit(text) -> bool:
+    return _norm_speech(text) in _QUIT_NORM
 
 
 def _deny_pending(reason=_INTERRUPT_ANSWER):
@@ -242,6 +258,7 @@ def make_permission_gate(mouth):
                                    "what": what, "detail": detail,
                                    "phase": "ask"})
         answer = None
+        noask_pending = False
         try:
             deadline = loop.time() + PERM_TIMEOUT_S
             while answer is None:
@@ -280,6 +297,42 @@ def make_permission_gate(mouth):
                                                "phase": "detail"})
                     deadline = loop.time() + PERM_TIMEOUT_S
                     continue
+                # "Stop asking for permission" works HERE too. The moment
+                # someone most wants the checks off is mid-burst, when
+                # every utterance is consumed as an answer to a pending
+                # ask -- exactly when the console phrase could never get
+                # through (it landed as a denial instead; upstream issue
+                # #14, fix taken from the reporter). Same confirm step as
+                # the console; confirming also approves the ask that's
+                # waiting, since auto-approve would have.
+                if (got != _INTERRUPT_ANSWER
+                        and _norm_speech(got) in CONSOLE_VERBS["noask"]):
+                    log("[perm]   noask requested mid-ask")
+                    mouth.say("Auto-approve means I act without asking, "
+                              "and it becomes your saved default. Say "
+                              "confirm to switch, and I'll go ahead "
+                              "with this one too.")
+                    noask_pending = True
+                    deadline = loop.time() + PERM_TIMEOUT_S
+                    continue
+                if (noask_pending and got != _INTERRUPT_ANSWER
+                        and _norm_speech(got) in (
+                            "confirm", "confirmed", "yes confirm",
+                            "yes confirmed")):
+                    saved = _write_config_key("permission_mode",
+                                              "bypassPermissions")
+                    _AUTOAPPROVE["on"] = True
+                    log("[console] permission_mode -> bypassPermissions"
+                        + (" (saved)" if saved else " (session only)")
+                        + " [flipped mid-ask]")
+                    mouth.say(("Auto-approve on, and saved as your "
+                               "default. " if saved else
+                               "Auto-approve on for this session. ")
+                              + "Going ahead.")
+                    signals.set_state("thinking")
+                    signals.static_start()
+                    return PermissionResultAllow(behavior="allow")
+                noask_pending = False   # any other reply answers the ask
                 answer = got
         finally:
             _PERM["fut"] = None
@@ -616,6 +669,11 @@ def _inbox_reader(q: "queue.Queue[str]"):
         except OSError:
             names = []
         for name in names:
+            if name.endswith(".tmp"):
+                # the dashboard's write-then-rename in flight: reading it
+                # here ate a half-written message and made the rename
+                # fail, so the message vanished silently (found 2026-09-04)
+                continue
             path = os.path.join(inbox, name)
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -626,6 +684,20 @@ def _inbox_reader(q: "queue.Queue[str]"):
             if text:
                 q.put(text)
         time.sleep(0.2)
+
+
+def _typed_get(q: "queue.Queue[str]"):
+    """q.get() that gives up when _STOP is set. A bare blocking get() in
+    the default executor can never be cancelled -- asyncio's cancel() drops
+    the future, not the thread -- and asyncio.run() joins that thread on
+    the way out. Returns None on shutdown; the main loop already treats a
+    falsy result as nothing to do."""
+    while not _STOP.is_set():
+        try:
+            return q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+    return None
 
 
 async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
@@ -950,8 +1022,7 @@ async def amain():
         if _PERM["fut"] is not None and not _PERM["fut"].done():
             started_after = (spoke_from is None
                              or spoke_from >= _PERM["asked_at"])
-            if _norm_speech(text) in {_norm_speech(q)
-                                      for q in QUIT_PHRASES}:
+            if _is_quit(text):
                 _PERM["fut"].set_result("no")
                 # falls through to the quit body below
             elif started_after:
@@ -969,11 +1040,10 @@ async def amain():
                     "confirm", "confirmed", "yes confirm",
                     "yes confirmed"):
                 verb = pend + ":confirmed"
-            elif not expired and not any(q in text.lower()
-                                         for q in QUIT_PHRASES):
+            elif not expired and not _is_quit(text):
                 mouth.say("Staying as we are.")
                 return True
-        if any(q in text.lower() for q in QUIT_PHRASES):
+        if _is_quit(text):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
             mouth.shut_up()
@@ -1041,7 +1111,7 @@ async def amain():
                 if mic_fut is not None and mic_fut.done():
                     mic_fut.result(); mic_fut = None
             if typed_fut is None:
-                typed_fut = loop.run_in_executor(None, typed_q.get)
+                typed_fut = loop.run_in_executor(None, _typed_get, typed_q)
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
             waiters = {press_fut, typed_fut}
@@ -1130,6 +1200,11 @@ async def amain():
         pass
     finally:
         _MIC["gen"] += 1     # abort any live open-mic capture promptly
+        # Release the two blocking executor jobs (typed reader, talk-key
+        # wait) so asyncio.run() can finish joining the default executor
+        # instead of hanging after "hung up" (upstream issue #24).
+        _STOP.set()
+        ptt.stop()
         if speak_task and not speak_task.done():
             speak_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too

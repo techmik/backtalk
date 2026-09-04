@@ -86,10 +86,23 @@ class PTTListener:
         self._held = False
         self._release_t = None          # a release awaiting confirmation
         self._press_evt = threading.Event()
+        self._stopping = False          # set by stop(): wait_press returns
         self._listener = keyboard.Listener(on_press=self._on_press,
                                            on_release=self._on_release)
         self._listener.daemon = True
         self._listener.start()
+
+    def stop(self):
+        """Release a blocked wait_press() and end the key hook. The wait
+        runs in asyncio's default executor, which asyncio.run() joins on
+        exit; a wait that never returns kept the whole process alive
+        after hangup (upstream issue #24)."""
+        self._stopping = True
+        self._press_evt.set()
+        try:
+            self._listener.stop()
+        except Exception:
+            pass
 
     def _on_press(self, k):
         if k != self._key:
@@ -121,6 +134,8 @@ class PTTListener:
         # settle-then-wait would then block forever: the next press is
         # filtered as key-repeat, so nothing ever sets the event again.
         while True:
+            if self._stopping:
+                return
             self._settle()
             if self._press_evt.wait(timeout=self.RELEASE_GRACE):
                 self._press_evt.clear()
