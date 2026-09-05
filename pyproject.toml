@@ -15,9 +15,14 @@ dependencies = [
     # platform keeps faster-whisper, which already uses CUDA.
     "mlx-whisper>=0.4.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26.0",
-    "nvidia-cublas-cu12>=12.9.2.10",
-    "nvidia-cuda-runtime-cu12>=12.9.79",
-    "nvidia-cudnn-cu12>=9.24.0.43",
+    # faster-whisper's CUDA backend needs these, but only Windows can't find
+    # them on its own -- ears.py's _add_nvidia_dll_dirs() (win32-only) points
+    # CTranslate2 at the pip wheels. Linux+NVIDIA resolves CUDA without them
+    # (matches upstream, which doesn't pin these at all); on Mac they're ~1 GB
+    # of dead weight. So: Windows only.
+    "nvidia-cublas-cu12>=12.9.2.10 ; sys_platform == 'win32'",
+    "nvidia-cuda-runtime-cu12>=12.9.79 ; sys_platform == 'win32'",
+    "nvidia-cudnn-cu12>=9.24.0.43 ; sys_platform == 'win32'",
     "pynput>=1.8.0",
     "setuptools<81",
     "sounddevice>=0.5.0",
