@@ -10,6 +10,9 @@ logs/
 # they had local edits. An enumerated list goes stale the day the code grows.
 # (.voice_* also covers .voice_transcript.jsonl and the .voice_inbox/ dir.)
 .voice_*
+# .backtalk_session (session id for resume_last_session) lands in the repo
+# root, not under .voice_, so the glob above misses it.
+.backtalk_session
 uv.lock
 backtalk.egg-info/
 # your personal config, created at setup: never tracked, never touched by updates

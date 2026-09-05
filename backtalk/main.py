@@ -169,10 +169,7 @@ def _human_what(tool, tool_input, ctx):
         path = str(d.get("file_path") or d.get("notebook_path")
                    or "a file").replace("\\", "/")
         name = path.rsplit("/", 1)[-1]
-        import os as _os
-        homes = [CFG.get("agent_dir", "")] + list(CFG.get("extra_dirs")
-                                                  or [])
-        in_vault = any(h and path.startswith(str(h).rstrip("/") + "/")
+        in_vault = any(h and path.startswith(str(h).replace("\\", "/").rstrip("/") + "/")
                        for h in (CFG.get("extra_dirs") or []))
         verb = "edit" if "Edit" in tool else "create or change"
         if in_vault and name.endswith(".md"):
