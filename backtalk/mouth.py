@@ -556,6 +556,42 @@ class Mouth:
         self._out = None
         self._out_rate = None
 
+    def rebuild_audio(self) -> bool:
+        """Tear down and re-initialise PortAudio so the NEXT sentence
+        opens its output stream on whatever the OS calls the default
+        device right now.
+
+        This is the deliberate, on-request twin of the crash-recovery
+        rebuild in ears._reopen_after_device_change. It exists because
+        audio law #1 holds ONE output stream for the life of the process
+        and never reopens it under normal play — so switching the OS
+        default output mid-session (earbuds -> speakers) does not move
+        the voice, even though the thinking sound and beeps, which are
+        fresh subprocesses, follow it immediately.
+
+        sd._initialize() re-reads the default device; the held stream is
+        left stale on purpose — _get_out() finds it dead on the next
+        sentence and rebuilds it fresh, exactly as on a sample-rate
+        switch, at the cost of one onset blip.
+
+        Call with the mouth already quiesced (shut_up() then
+        wait_done()): terminating PortAudio under a live write is a
+        needless race. Returns False (and logs) if the audio system will
+        not come back up.
+        """
+        try:
+            sd._terminate()
+        except Exception:
+            pass                       # already down; re-init is the point
+        try:
+            sd._initialize()
+        except Exception as e:
+            log(f"[mouth] could not re-initialise the audio system: {e}")
+            return False
+        log("[mouth] audio system rebuilt — next sentence opens on the "
+            "current default output device")
+        return True
+
     def _play_stream(self, sentence: str, directions=None, block: int = 2205,
                      prebuffer_s: float = 0.75):
         """Stream-synthesize and play with the head-start buffer (audio

@@ -30,8 +30,10 @@ session itself so you never go back to the keyboard: "clear the
 session" / "compact the session" / "switch to the deep model" / "back
 to the fast model" / "set effort to low" (or medium, high, max) /
 "usage report" / "go hands free" and "push to talk mode" (the MIC) /
-"stop asking for permission" and "start asking again" (permissions,
-called auto-approve, a different axis than the microphone on purpose).
+"switch audio output" (move the voice to the current default output
+device, for hot-swapping earbuds and speakers mid-session) / "stop
+asking for permission" and "start asking again" (permissions, called
+auto-approve, a different axis than the microphone on purpose).
 And with permission_mode "ask" (the default), gated tool calls ASK OUT
 LOUD and your spoken yes or no decides them; any other answer is
 passed back to the agent as the reason.
@@ -386,6 +388,11 @@ CONSOLE_VERBS = {
                   "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
+    "swapout":   ("switch audio output", "switch the audio output",
+                  "swap audio output", "swap the audio output",
+                  "change audio output", "change the audio output",
+                  "switch output device", "switch the output device",
+                  "switch audio device", "switch the audio device"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -960,6 +967,18 @@ async def amain():
                        "past a restart. ")
                       + "Say start asking again any time to flip it "
                         "back.")
+        elif verb == "swapout":
+            resp = ""
+            # Quiesce the worker before touching PortAudio, then rebuild
+            # so the next line lands on the current default output device.
+            mouth.shut_up()
+            mouth.wait_done(timeout=2)
+            if mouth.rebuild_audio():
+                mouth.say("Audio output switched. If you can hear this, "
+                          "it's on the current default device.")
+            else:
+                mouth.say("I couldn't rebuild the audio system. Check "
+                          "this window for the error.")
         elif verb == "ask":
             resp = ""
             saved = _write_config_key("permission_mode", "ask")
