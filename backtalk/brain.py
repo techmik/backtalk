@@ -47,6 +47,47 @@ from backtalk.vlog import log
 from backtalk import signals
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+
+# Titles / abbreviations that carry a "." mid-sentence. A sentence break
+# found right after one of these ("Dr. Johnson", "at 9 a.m. Tuesday",
+# "e.g. this one") is a false split -- the mouth would ship "Dr." as its
+# own clipped chunk. Compared case-insensitively against the dotted token
+# just before the break; lone initials ("J." in "J. R. R. Tolkien") are
+# suppressed the same way. Only the "." case is guarded -- "!" and "?"
+# after an abbreviation effectively never happen.
+_ABBREV = frozenset("""
+    dr mr mrs ms mx prof rev fr sr jr hon gen sen rep gov
+    capt sgt lt col st mt
+    vs etc et al vol fig pp ca approx dept est inc corp co ltd
+    e.g i.e cf ibid
+    a.m p.m u.s u.k u.n e.u d.c ph.d b.a m.a m.d
+""".split())
+
+
+def _is_abbrev_dot(head: str) -> bool:
+    """True if `head` (text up to and including a ".") ends on an
+    abbreviation or a lone initial rather than a real sentence."""
+    parts = head.split()
+    if not parts:
+        return False
+    bare = parts[-1].lower().rstrip(".")
+    if bare in _ABBREV:
+        return True
+    return len(bare) == 1 and bare.isalpha()      # lone initial: "J."
+
+
+def _first_real_break(prose: str):
+    """Index just past the first *true* sentence end in `prose`, or None.
+    Skips a break that lands right after an abbreviation or a lone
+    initial so "Dr. Johnson" is never spoken as two chunks."""
+    for m in _SENTENCE_END.finditer(prose):
+        head = prose[:m.start()]              # up to & including . ! or ?
+        if head.endswith(".") and _is_abbrev_dot(head):
+            continue
+        return m.end()
+    return None
+
+
 # Thinking flushes to the transcript bus on a newline OR a sentence end,
 # so a long reasoning pause streams to a dashboard as it forms instead of
 # landing in one lump at block end (glued to the first spoken sentence).
@@ -181,11 +222,11 @@ class _StreamSplitter:
     def _drain_prose(self, force):
         out = []
         while True:
-            m = _SENTENCE_END.search(self._prose)
-            if not m:
+            cut = _first_real_break(self._prose)
+            if cut is None:
                 break
-            s = self._prose[:m.end()].strip()
-            self._prose = self._prose[m.end():]
+            s = self._prose[:cut].strip()
+            self._prose = self._prose[cut:]
             if s:
                 self._route_prose(s, out)
         if force and self._prose.strip():

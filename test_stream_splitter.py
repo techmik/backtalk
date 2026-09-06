@@ -162,6 +162,51 @@ def test_overlong_sentence_rerouted():
     assert s.had_code is True
 
 
+def test_title_abbreviation_not_split():
+    # "Dr. Johnson" must not ship "Dr." as its own clipped chunk.
+    spoken, _, _ = run(["Dr. Johnson has an appointment. ", "Her office called."])
+    assert spoken == ["Dr. Johnson has an appointment.", "Her office called."]
+
+
+def test_am_pm_not_split():
+    spoken, _, _ = run(["Be there at 9 a.m. sharp tomorrow. Bring coffee."])
+    assert spoken == ["Be there at 9 a.m. sharp tomorrow.", "Bring coffee."]
+
+
+def test_initials_not_split():
+    spoken, _, _ = run(["I love J. R. R. Tolkien novels. They hold up."])
+    assert spoken == ["I love J. R. R. Tolkien novels.", "They hold up."]
+
+
+def test_eg_not_split():
+    spoken, _, _ = run(["Pick a color, e.g. blue works. Then submit."])
+    assert spoken == ["Pick a color, e.g. blue works.", "Then submit."]
+
+
+def test_us_initialism_not_split():
+    spoken, _, _ = run(["He moved to the U.S. last year. Now he is back."])
+    assert spoken == ["He moved to the U.S. last year.", "Now he is back."]
+
+
+def test_real_period_after_abbrev_still_splits():
+    spoken, _, _ = run(["Ask Dr. Smith. Then wait."])
+    assert spoken == ["Ask Dr. Smith.", "Then wait."]
+
+
+def test_no_is_still_a_real_sentence_end():
+    # "no" was deliberately kept OUT of _ABBREV -- it is a real reply.
+    spoken, _, _ = run(["The answer is no. Ask again later."])
+    assert spoken == ["The answer is no.", "Ask again later."]
+
+
+def test_char_by_char_abbrev_parity():
+    chunks = ["Dr. Johnson called at 3 p.m. today. It went fine."]
+    a = run(chunks)
+    b = run(chunks, char_by_char=True)
+    assert a[0] == b[0] == ["Dr. Johnson called at 3 p.m. today.",
+                            "It went fine."]
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
