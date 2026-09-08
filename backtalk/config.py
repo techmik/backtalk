@@ -155,6 +155,36 @@ DEFAULTS = {
     #
     # NOT "stt_device" below, which is the Whisper COMPUTE device.
     "mic_device": "",
+    # The speaker to play the voice through, matched by NAME -- the
+    # OUTPUT twin of mic_device above. "" means whatever the OS calls
+    # the default output, which is right on most machines.
+    #
+    # Pin it to a real device name and the voice survives a device
+    # RENUMBERING -- a phone or a Bluetooth dongle joining or leaving
+    # shifts every PortAudio index underneath the held output stream,
+    # with no error and nothing in the log, so the voice just stops
+    # coming out of the speakers -- and it also follows the OS default
+    # when that moves. A name and never an index, same reason as
+    # mic_device. Exact name wins, then the first case-insensitive
+    # substring; a name matching nothing falls back to the default and
+    # logs the outputs it saw, so the voice degrades, never goes mute.
+    #
+    # Independent of the "switch audio output" voice verb: that verb is
+    # the manual, on-request rebuild; this key makes the follow
+    # automatic (checked on every sentence, one cheap device query).
+    "speaker_device": "",
+    # PortAudio caches the device list at init and (on Windows) never
+    # refreshes it on a device add/remove or default switch, so the
+    # speaker_device check above can't see a mid-session output switch
+    # on a split mic/speaker rig -- nothing the ears would notice
+    # breaks, so nothing re-inits. Bridge: when the first sentence of a
+    # reply comes THIS many seconds after the last reply finished (the
+    # user was typing or talking their next turn), refresh PortAudio
+    # first so the voice lands on the current default. Costs one faint
+    # onset blip on that sentence, landing where a reply starts anyway.
+    # 0 disables it (rely on the "switch audio output" verb instead).
+    # Raise it on a machine whose audio devices never change.
+    "speaker_recheck_idle_s": 10,
     # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
     # goes in a file: it's read from the macOS Keychain (item
     # `backtalk-elevenlabs`) or Linux secret-tool, with the

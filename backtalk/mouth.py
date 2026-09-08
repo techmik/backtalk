@@ -46,6 +46,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -413,6 +414,67 @@ def synth_stream(text: str, timeout: float = 30.0):
         yield KOKORO_RATE, pcm
 
 
+_speaker_device_warned = False
+
+
+def _speaker_index():
+    """Resolve speaker_device (a device NAME) to a CONCRETE output
+    index. The OUTPUT twin of ears._mic_index().
+
+    Returns a concrete index whenever a default exists — never None in
+    that case — because a stored None is exactly what hides a device
+    renumbering: a phone or a Bluetooth dongle joining or leaving
+    shifts PortAudio's indices under the held output stream, with no
+    exception raised and nothing in the log. Compared on every
+    _get_out() so the voice follows the move.
+
+    Exact name wins, then the first case-insensitive substring, so a
+    precise name can never be beaten by a loose one. A name matching
+    nothing falls back to the default and logs the outputs it saw —
+    the voice degrades, it never goes mute.
+    """
+    global _speaker_device_warned
+    want = str(CFG.get("speaker_device", "") or "").strip()
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        log(f"[mouth] could not list audio devices ({e}) — default output")
+        return None
+    outs = [(i, d) for i, d in enumerate(devices)
+            if d.get("max_output_channels", 0) > 0]
+    if want:
+        for i, d in outs:
+            if d["name"] == want:
+                _speaker_device_warned = False
+                return i
+        low = want.lower()
+        for i, d in outs:
+            if low in d["name"].lower():
+                _speaker_device_warned = False
+                return i
+        if not _speaker_device_warned:      # once per disappearance
+            _speaker_device_warned = True
+            log(f"[mouth] speaker_device {want!r} not found — using the "
+                f"system default. Outputs I can see: "
+                f"{[d['name'] for _, d in outs]}")
+    # Default case — resolve to a concrete index so a later renumber is
+    # visible as a changed value rather than a constant None.
+    try:
+        idx = sd.default.device[1]
+        if isinstance(idx, (int, np.integer)) and idx >= 0:
+            return int(idx)
+    except Exception:
+        pass
+    try:
+        name = sd.query_devices(kind="output")["name"]
+        for i, d in outs:
+            if d["name"] == name:
+                return i
+    except Exception:
+        pass
+    return None
+
+
 class Mouth:
     def __init__(self):
         from backtalk.ducking import Ducker
@@ -423,6 +485,16 @@ class Mouth:
         # Worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
+        # The concrete output index the held stream is bound to. A
+        # change between sentences means the device list moved under us
+        # — a renumbering or a default switch, neither of which raises
+        # (see _speaker_index). _get_out rebuilds when it does.
+        self._out_dev: int | None = None
+        # monotonic time the last reply finished speaking. _get_out uses
+        # the gap since then to decide whether to refresh PortAudio's
+        # cached device list before the next reply — see the comment
+        # there. 0.0 = nothing has played yet.
+        self._last_play_end: float = 0.0
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         # Optional () -> bool set by main.py to brain._dirty. When the speech
         # queue drains we normally stamp "idle" -- but a filler line ("on it,
@@ -497,6 +569,7 @@ class Mouth:
             finally:
                 if self._q.empty():
                     self._speaking.clear()
+                    self._last_play_end = time.monotonic()
                     # The reply has genuinely stopped talking, as opposed to
                     # the gap between two sentences of the same reply.
                     signals.reply_done()
@@ -510,8 +583,37 @@ class Mouth:
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the
         sample rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback:
-        rare, costs at most one blip on the switch)."""
-        if self._out is not None and self._out_rate == rate:
+        rare, costs at most one blip on the switch), or when the output
+        device moves under us — a renumbering or a default switch,
+        neither of which raises (see _speaker_index)."""
+        # PortAudio snapshots the device list at init and (on Windows
+        # especially) never refreshes it on a device add/remove or a
+        # default switch, so _speaker_index() below only sees a change
+        # after a re-init. On a split mic/speaker rig — the mic on its
+        # own USB device, the voice on Bluetooth — switching the output
+        # default mid-session breaks nothing the ears would notice, so
+        # nothing re-inits and the voice stays on the old device.
+        # Bridge that: if this is the first sentence of a reply after a
+        # real pause (the user was typing or speaking their next turn),
+        # refresh PortAudio first so the voice lands on whatever the OS
+        # default is NOW. One faint onset blip, only after an idle gap,
+        # landing where a reply is starting anyway. Threshold is
+        # config so a machine that swaps devices rarely can raise it.
+        idle_s = float(CFG.get("speaker_recheck_idle_s", 10) or 0)
+        if (idle_s and self._out is not None and self._last_play_end
+                and time.monotonic() - self._last_play_end > idle_s):
+            try:
+                sd._terminate()
+                sd._initialize()
+                self._drop_out()   # the held stream died with _terminate;
+                #                    forget it so the rebuild below is clean
+                log("[mouth] refreshed the audio system after an idle gap "
+                    "— the voice will follow a mid-session output switch")
+            except Exception as e:
+                log(f"[mouth] idle audio refresh failed ({e}) — continuing")
+        dev = _speaker_index()
+        if (self._out is not None and self._out_rate == rate
+                and self._out_dev == dev):
             # Guarded, because the stream can die UNDER us: the ears
             # rebuild the whole audio system to recover from a device
             # change (see ears._reopen_after_device_change), and that
@@ -525,9 +627,14 @@ class Mouth:
                 return self._out
             except Exception:
                 log("[mouth] the output stream went away, reopening")
+        elif self._out is not None and self._out_dev != dev:
+            log(f"[mouth] output device moved ({self._out_dev} -> {dev}) "
+                f"— rebuilding the stream")
         self._drop_out()
-        self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+        self._out = sd.OutputStream(samplerate=rate, channels=1,
+                                    dtype="int16", device=dev)
         self._out_rate = rate
+        self._out_dev = dev
         self._out.start()
         return self._out
 
@@ -555,6 +662,7 @@ class Mouth:
                 pass
         self._out = None
         self._out_rate = None
+        self._out_dev = None
 
     def rebuild_audio(self) -> bool:
         """Tear down and re-initialise PortAudio so the NEXT sentence
@@ -562,12 +670,13 @@ class Mouth:
         device right now.
 
         This is the deliberate, on-request twin of the crash-recovery
-        rebuild in ears._reopen_after_device_change. It exists because
-        audio law #1 holds ONE output stream for the life of the process
-        and never reopens it under normal play — so switching the OS
-        default output mid-session (earbuds -> speakers) does not move
-        the voice, even though the thinking sound and beeps, which are
-        fresh subprocesses, follow it immediately.
+        rebuild in ears._reopen_after_device_change. Since _get_out now
+        also rebuilds automatically when _speaker_index() reports the
+        output device moved, this verb is the manual fallback: it still
+        covers the OS default moving to a device that was already
+        present (that shifts which index is default, so the same
+        comparison fires), and it re-reads PortAudio's own default in
+        case _speaker_index couldn't resolve one.
 
         sd._initialize() re-reads the default device; the held stream is
         left stale on purpose — _get_out() finds it dead on the next
