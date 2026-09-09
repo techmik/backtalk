@@ -343,6 +343,11 @@ class WarmBrain:
         # block? main.speak_reply reads it to cover a turn that rendered
         # code but spoke nothing.
         self._turn_had_code = False
+        # Consecutive _recover() calls with no completed turn between.
+        # A resumed session replaying a poisoned oversized message dies
+        # in the same spot forever (issue #38); after the first failed
+        # resume, treat the saved session as poisoned and start fresh.
+        self._recover_streak = 0
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -624,7 +629,10 @@ class WarmBrain:
         it down and reconnect (resuming the last completed turn when one
         was saved, fresh otherwise), then speak one line so the turn isn't
         silent. Anything said since the last completed turn is lost — a
-        working session beats a bricked one."""
+        working session beats a bricked one. On a second consecutive
+        failure with no clean turn between, the saved session itself is
+        the problem (it replays the killing message): move it aside and
+        start fresh. (issue #38)"""
         log(f"[brain] recovering ({reason})")
         self._dirty = False
         try:
@@ -632,15 +640,34 @@ class WarmBrain:
         except Exception:
             pass
         self._client = None
+        self._recover_streak += 1
+        # Second consecutive recovery with no clean turn between: the
+        # saved session is replaying the message that kills us (issue
+        # #38). Move it aside (not delete — recoverable by hand) and
+        # start fresh instead of resuming into the same death.
+        poisoned = self._recover_streak >= 2
         try:
             if CFG.get("resume_last_session"):
-                try:
-                    sid = open(SESSION_FILE).read().strip()
-                except OSError:
-                    sid = ""
-                self._resume_id = sid or None
+                if poisoned:
+                    try:
+                        os.replace(SESSION_FILE, f"{SESSION_FILE}.poisoned-"
+                                   f"{datetime.now():%Y%m%d-%H%M%S}")
+                        log("[brain] saved session poisoned — moved aside, "
+                            "starting fresh")
+                    except OSError:
+                        pass
+                    self._resume_id = None
+                else:
+                    try:
+                        sid = open(SESSION_FILE).read().strip()
+                    except OSError:
+                        sid = ""
+                    self._resume_id = sid or None
             await self.start()
-            yield ("Sorry — something you sent was too big and it dropped "
+            yield ("Something in our last session kept breaking my "
+                   "connection, so I started fresh — tell me where we were."
+                   if poisoned else
+                   "Sorry — something you sent was too big and it dropped "
                    "my connection. I'm back now. Ask me again.")
         except Exception as e:
             log(f"[brain] recovery failed: {e!r}")
@@ -733,6 +760,7 @@ class WarmBrain:
                             signals.set_state("thinking")
                 elif t == "ResultMessage":
                     self._dirty = False   # turn fully consumed — pipe aligned
+                    self._recover_streak = 0   # clean turn — not stuck
                     self._tally(msg)
                     self._remember_session(msg)
                     await self._pull_rate_limits()
