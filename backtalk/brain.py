@@ -48,6 +48,16 @@ from backtalk import signals
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
+# ask_stream never bounded the FIRST message out of receive_response the
+# way command() and reset_turn() do, so a turn that produced nothing at
+# all (a hung CLI subprocess on an expired sign-in — field case
+# 2026-09-09) sat silent forever with the face idle. Only the first
+# message is bounded: once messages are flowing a long gap is a real
+# tool call (an MCP 3D generation, a big Bash run, a pending permission
+# ask), not a stall. A first-message timeout raises into the same
+# recovery path a transport death takes.
+_STREAM_FIRST_TIMEOUT = 30
+
 # Titles / abbreviations that carry a "." mid-sentence. A sentence break
 # found right after one of these ("Dr. Johnson", "at 9 a.m. Tuesday",
 # "e.g. this one") is a false split -- the mouth would ship "Dr." as its
@@ -667,6 +677,9 @@ class WarmBrain:
             yield ("Something in our last session kept breaking my "
                    "connection, so I started fresh — tell me where we were."
                    if poisoned else
+                   "I'm not getting anything back from my command-line "
+                   "session — it may need to sign in again."
+                   if reason == "TimeoutError" else
                    "Sorry — something you sent was too big and it dropped "
                    "my connection. I'm back now. Ask me again.")
         except Exception as e:
@@ -686,9 +699,30 @@ class WarmBrain:
 
         split = _StreamSplitter(_emit_code)
         self._turn_had_code = False
+        _spoke_any = False
         try:
             await self._client.query(utterance)
-            async for msg in self._client.receive_response():
+            _it = self._client.receive_response().__aiter__()
+            _first = True
+            while True:
+                # Bound ONLY the first message: no reply at all this long
+                # after query() is a dead CLI subprocess (expired sign-in
+                # is the field case). Once messages flow, a long gap is a
+                # real tool call, so plain iteration from there.
+                try:
+                    if _first:
+                        msg = await asyncio.wait_for(
+                            _it.__anext__(), _STREAM_FIRST_TIMEOUT)
+                    else:
+                        msg = await _it.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as te:
+                    raise TimeoutError(
+                        f"no first SDK message in {_STREAM_FIRST_TIMEOUT}s "
+                        "- the CLI session looks dead (expired sign-in?)"
+                    ) from te
+                _first = False
                 t = type(msg).__name__
                 if t == "StreamEvent":
                     ev = getattr(msg, "event", {}) or {}
@@ -698,6 +732,7 @@ class WarmBrain:
                             # fence-aware: prose streams out to be spoken,
                             # fenced code is siphoned to the transcript bus
                             for sentence in split.feed(delta.get("text", "")):
+                                _spoke_any = True
                                 yield sentence
                         elif delta.get("type") == "thinking_delta":
                             # Reasoning stream: flush to the log AND the
@@ -729,6 +764,7 @@ class WarmBrain:
                         # glued to the answer: long dead air, then two
                         # thoughts at once. Fence state is left intact.
                         for tail in split.flush():
+                            _spoke_any = True
                             yield tail
                 elif t == "AssistantMessage":
                     # Tool calls: surface WHAT the agent does, not just its
@@ -765,6 +801,25 @@ class WarmBrain:
                     self._remember_session(msg)
                     await self._pull_rate_limits()
                     await self._publish_context()
+                    if getattr(msg, "is_error", False):
+                        errs = "; ".join(getattr(msg, "errors", None) or [])
+                        status = getattr(msg, "api_error_status", None)
+                        log("[brain] turn returned an error"
+                            + (f" (HTTP {status})" if status else "")
+                            + (f": {errs[:200]}" if errs else ""))
+                        for tail in split.flush():
+                            _spoke_any = True
+                            yield tail
+                        yield ("Something went wrong on my end and the "
+                               "turn came back empty. If this keeps up, "
+                               "my command-line session may need to sign "
+                               "in again.")
+                    elif not _spoke_any and not self._turn_had_code:
+                        for tail in split.flush():
+                            _spoke_any = True
+                            yield tail
+                        if not _spoke_any:
+                            yield "I got nothing back that time. Ask me again."
                     break
         except GeneratorExit:
             raise
