@@ -138,6 +138,12 @@ DEFAULTS = {
     # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
     "stt_device": "auto",
     "stt_compute": "int8",
+    # Biases the decoder toward specific vocabulary (names, jargon,
+    # brand names) without retraining -- Whisper treats it as prior
+    # context, not literal text to transcribe. "" = no bias. Helps with
+    # words that sound like a common English word (e.g. "Tripo" heard
+    # as "triple").
+    "stt_initial_prompt": "",
     # The microphone to record from, matched by NAME. "" means whatever
     # the OS calls the default input, which is right on most machines.
     #

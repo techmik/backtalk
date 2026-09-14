@@ -361,13 +361,16 @@ def transcribe(pcm: np.ndarray) -> str:
     model = warm()
     audio = pcm.astype(np.float32) / 32768.0
     lang = "en" if CFG["stt_model"].endswith(".en") else None
+    prompt = CFG["stt_initial_prompt"] or None
     if _backend == "mlx":
         import mlx_whisper
         text = mlx_whisper.transcribe(audio, path_or_hf_repo=model,
                                       temperature=0.0, language=lang,
+                                      initial_prompt=prompt,
                                       verbose=None)["text"].strip()
     else:
-        segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
+        segments, _ = model.transcribe(audio, temperature=0.0, language=lang,
+                                        initial_prompt=prompt)
         text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
 
