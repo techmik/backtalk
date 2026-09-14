@@ -34,7 +34,7 @@ import re
 import warnings
 from datetime import datetime
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 
 try:
     from claude_agent_sdk import CanUseToolShadowedWarning
@@ -47,6 +47,61 @@ from backtalk.vlog import log
 from backtalk import signals
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+
+# A verbose Bash result (git output, a build log, a long script's stdout)
+# feeds straight back into the model's next turn as prompt tokens -- in a
+# voice session that's extra prompt-processing time before the reply can
+# even start, i.e. more audible dead air on top of whatever the thinking
+# sound already covers. Trim before it goes back, not after.
+_BASH_OUTPUT_CHAR_LIMIT = 1500  # keep first ~20-30 lines, well under a
+                                # typical short-command's output
+_bash_shape_logged = False     # log the real tool_response shape once,
+                                # on the first real Bash call -- the shape
+                                # was unverified as of 2026-09-14 (see the
+                                # Backtalk.md vault note)
+
+
+async def _trim_bash_output(input_data, tool_use_id, context):
+    """PostToolUse hook: cap Bash tool output before it re-enters the
+    model's context. Shape of tool_response isn't documented per-tool by
+    the SDK (typed as Any) -- handle a plain string or a dict with a
+    stdout/output/content key defensively, and never raise: a truncation
+    feature must not be the thing that breaks a tool call."""
+    global _bash_shape_logged
+    if input_data.get("tool_name") != "Bash":
+        return {}
+    try:
+        resp = input_data.get("tool_response")
+        if not _bash_shape_logged:
+            _bash_shape_logged = True
+            log(f"[hook] first real Bash tool_response shape: "
+                f"type={type(resp).__name__} "
+                f"repr={str(resp)[:300]!r}")
+        if isinstance(resp, str):
+            text, container = resp, None
+        elif isinstance(resp, dict):
+            key = next((k for k in ("stdout", "output", "content")
+                        if isinstance(resp.get(k), str)), None)
+            if not key:
+                return {}
+            text, container = resp[key], key
+        else:
+            return {}
+        if len(text) <= _BASH_OUTPUT_CHAR_LIMIT:
+            return {}
+        trimmed = (text[:_BASH_OUTPUT_CHAR_LIMIT]
+                   + f"\n...[{len(text) - _BASH_OUTPUT_CHAR_LIMIT} more "
+                     "chars truncated for voice session]")
+        updated = trimmed if container is None else {**resp, container: trimmed}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "updatedToolOutput": updated,
+            }
+        }
+    except Exception as e:
+        log(f"[hook] _trim_bash_output failed, passing through: {e}")
+        return {}
 
 # ask_stream never bounded the FIRST message out of receive_response the
 # way command() and reset_turn() do, so a turn that produced nothing at
@@ -395,6 +450,9 @@ class WarmBrain:
                 thinking={"type": "adaptive", "display": "summarized"},
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
+                hooks={"PostToolUse": [
+                    HookMatcher(matcher="Bash", hooks=[_trim_bash_output]),
+                ]},
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
                 # The SDK frames the CLI's NDJSON one line per message and
