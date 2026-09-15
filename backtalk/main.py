@@ -856,6 +856,11 @@ async def amain():
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
     log("[backtalk] brain warm")
+    if getattr(brain, "degraded", False):
+        # local_fallback caught a failed connect: the warmup ran on the
+        # local brain and its yields were discarded above, so say it here
+        mouth.say("Heads up: I couldn't reach Claude, so I'm on the local "
+                  "backup brain until it's back. Slower and dumber, but here.")
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
     # a configured effort level applies at launch (saved by the spoken

@@ -113,6 +113,33 @@ async def _trim_bash_output(input_data, tool_use_id, context):
 # recovery path a transport death takes.
 _STREAM_FIRST_TIMEOUT = 30
 
+# ---- local fallback (config: local_fallback, off by default) ------------
+# While degraded, a periodic cloud probe tries Claude first; a dead cloud
+# is bounded tighter than a normal turn so the probe costs the person
+# seconds, not half a minute, before the local brain answers instead.
+_PROBE_FIRST_TIMEOUT = 12
+# A connect that hangs is treated as an outage only when a local brain can
+# take over; without one the old unbounded connect (and main's boot guard)
+# apply exactly as before.
+_CONNECT_TIMEOUT_DEGRADABLE = 60
+# What counts as "Claude is unreachable" on an error ResultMessage: the
+# API refusing/overloaded/limited, auth gone, or the CLI unable to reach
+# the network. A 400-class content error is NOT an outage -- the local
+# brain must not take a turn Claude merely rejected.
+_OUTAGE_STATUSES = {401, 403, 408, 429, 500, 502, 503, 504, 529}
+_OUTAGE_HINTS = ("overloaded", "rate limit", "rate_limit", "usage limit",
+                 "out of usage", "fetch failed", "econn", "enotfound",
+                 "etimedout", "network", "connection", "unable to reach",
+                 "not signed in", "not logged in", "authentication",
+                 "unauthorized")
+
+
+def _is_outage(status, errs: str) -> bool:
+    if status in _OUTAGE_STATUSES:
+        return True
+    e = (errs or "").lower()
+    return any(h in e for h in _OUTAGE_HINTS)
+
 # Titles / abbreviations that carry a "." mid-sentence. A sentence break
 # found right after one of these ("Dr. Johnson", "at 9 a.m. Tuesday",
 # "e.g. this one") is a false split -- the mouth would ship "Dr." as its
@@ -382,7 +409,8 @@ def _tool_result_text(block) -> str:
 
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None,
-                 resume_id: str | None = None):
+                 resume_id: str | None = None,
+                 local_fallback: dict | None = None):
         # Full model id ON PURPOSE — never a bare alias. The SDK
         # resolves aliases through its own bundled CLI and can silently
         # land on an older model.
@@ -413,6 +441,28 @@ class WarmBrain:
         # in the same spot forever (issue #38); after the first failed
         # resume, treat the saved session as poisoned and start fresh.
         self._recover_streak = 0
+        # OPTIONAL break-glass local brain (config: local_fallback). None
+        # unless enabled, and every hook below is an `if self._local`
+        # guard that stays false -- the SDK path is byte-for-byte the
+        # same behaviour when it's off. `local_fallback` as a parameter
+        # exists for tests; main passes nothing and the config applies.
+        lf = local_fallback if local_fallback is not None \
+            else (CFG.get("local_fallback") or {})
+        self._lf = lf
+        self._local = None
+        if lf.get("enabled"):
+            # Lazy: local_brain imports this module for the splitter.
+            from backtalk.local_brain import LocalBrain
+            self._local = LocalBrain(
+                lf, name=str(CFG.get("name") or "Assistant"),
+                agent_dir=CFG["agent_dir"],
+                extra_dirs=CFG.get("extra_dirs") or (),
+                can_use_tool=can_use_tool)
+        # True while turns are answered locally because Claude failed;
+        # cleared the moment a cloud turn completes clean again.
+        self.degraded = False
+        self._degraded_turns = 0     # local turns since the switch (re-probe cadence)
+        self._last_turn_local = False  # interrupt() must not poke the SDK for a local turn
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -482,7 +532,76 @@ class WarmBrain:
                 except Exception:
                     pass
         self._client = ClaudeSDKClient(options=_opts(None))
-        await self._client.connect()
+        if not self._local:
+            await self._client.connect()
+            return
+        # With a local brain configured, a connect that fails or hangs
+        # (no sign-in, no network, no usage) degrades instead of killing
+        # the launch -- main's boot guard would otherwise exit the whole
+        # voice line. Re-raised only when the local brain can't come up
+        # either, so that guard still speaks its line in that case.
+        try:
+            await asyncio.wait_for(self._client.connect(),
+                                   _CONNECT_TIMEOUT_DEGRADABLE)
+        except (Exception, asyncio.TimeoutError) as e:
+            log(f"[brain] connect failed ({type(e).__name__}: "
+                f"{str(e)[:120]})")
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+            if not await self._local.ensure_up():
+                raise
+            self._enter_degraded()
+
+    # ---- local fallback --------------------------------------------------
+
+    def _enter_degraded(self):
+        if self.degraded:
+            return
+        self.degraded = True
+        self._degraded_turns = 0
+        log("[brain] DEGRADED: Claude unreachable, answering on the local brain")
+        signals.transcript("system", "Claude unreachable -- switched to the local brain")
+
+    async def _leave_degraded(self):
+        self.degraded = False
+        self._degraded_turns = 0
+        log("[brain] recovered: Claude is answering again")
+        signals.transcript("system", "Claude is back -- local brain released")
+        self._local.reset()
+        if self._lf.get("stop_when_recovered", True):
+            self._local.stop_server()
+
+    async def _failover(self, utterance: str, why: str):
+        """Answer THIS turn on the local brain, entering degraded mode
+        (announced once) on the way in. Yields spoken lines."""
+        log(f"[brain] failing over to local ({why})")
+        if not await self._local.healthy():
+            # first trigger of an outage: the server is started lazily,
+            # and a cold model load is tens of seconds -- say so rather
+            # than sit silent through it
+            yield "Claude's not answering. One moment, waking the local backup brain."
+            if not await self._local.ensure_up():
+                yield ("It didn't come up, so I've got no brain to answer "
+                       "with right now. Try me again in a bit.")
+                return
+        first = not self.degraded
+        self._enter_degraded()
+        if first:
+            yield ("Okay, I'm on the local backup brain until Claude's "
+                   "back. Slower and a good deal dumber: no memory, no "
+                   "skills, just your files.")
+        self._degraded_turns += 1
+        self._last_turn_local = True
+        self._dirty = True            # main's turn_active reads this
+        try:
+            async for s in self._local.ask_stream(utterance):
+                yield s
+        finally:
+            self._turn_had_code = self._local._turn_had_code
+            self._dirty = False       # no SDK pipe to drain for this turn
 
     async def set_permission_mode(self, backtalk_mode: str):
         """Live flip, no reconnect, conversation intact ("ask" maps to
@@ -604,6 +723,9 @@ class WarmBrain:
         stream is not trusted to always deliver, and an unbounded await
         here would deafen the whole voice loop. On timeout the pipe is
         left marked dirty so the next reset_turn drains or rebuilds."""
+        if self._client is None:
+            # only possible while degraded from boot: no CLI session exists
+            return "error: Claude is unreachable, so console commands are off until it's back"
         self._dirty = True
         await self._client.query(cmd)
         texts = []
@@ -633,7 +755,8 @@ class WarmBrain:
         return " ".join(texts).strip()
 
     async def interrupt(self):
-        if self._client:
+        # A cancelled local turn has nothing in the SDK pipe to stop.
+        if self._client and not self._last_turn_local:
             await self._client.interrupt()
 
     async def reset_turn(self, timeout: float = 8.0):
@@ -689,8 +812,12 @@ class WarmBrain:
         if self._client:
             await self._client.disconnect()
             self._client = None
+        if self._local:
+            if self._lf.get("stop_when_recovered", True):
+                self._local.stop_server()   # only a server WE started
+            await self._local.close()
 
-    async def _recover(self, reason: str):
+    async def _recover(self, reason: str, quiet: bool = False):
         """A dead SDK client — transport crash mid-turn, most often a big
         tool result (an image Read, base64-encoded) overrunning the NDJSON
         line buffer — must not sit dead for the rest of the session. Tear
@@ -700,7 +827,10 @@ class WarmBrain:
         working session beats a bricked one. On a second consecutive
         failure with no clean turn between, the saved session itself is
         the problem (it replays the killing message): move it aside and
-        start fresh. (issue #38)"""
+        start fresh. (issue #38)
+
+        quiet=True rebuilds without speaking: the caller is about to hand
+        the turn to the local brain and will explain that instead."""
         log(f"[brain] recovering ({reason})")
         self._dirty = False
         try:
@@ -732,6 +862,8 @@ class WarmBrain:
                         sid = ""
                     self._resume_id = sid or None
             await self.start()
+            if quiet:
+                return
             yield ("Something in our last session kept breaking my "
                    "connection, so I started fresh — tell me where we were."
                    if poisoned else
@@ -742,11 +874,43 @@ class WarmBrain:
                    "my connection. I'm back now. Ask me again.")
         except Exception as e:
             log(f"[brain] recovery failed: {e!r}")
+            if quiet:
+                return
             yield ("I lost my connection and couldn't get it back. "
                    "Restart me when you get a chance.")
 
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
+        first_timeout = _STREAM_FIRST_TIMEOUT
+        if self._local:
+            # Forced: every turn local (testing). Degraded: local, except
+            # that every Nth turn probes Claude first and falls back
+            # within the same turn if it's still down.
+            n = int(self._lf.get("retry_cloud_every_n_turns") or 0)
+            probe = (self.degraded and n > 0 and self._degraded_turns > 0
+                     and self._degraded_turns % n == 0)
+            if self._lf.get("force"):
+                async for s in self._failover(utterance, "forced by config"):
+                    yield s
+                return
+            if self.degraded and not probe:
+                async for s in self._failover(utterance, "degraded"):
+                    yield s
+                return
+            if probe:
+                log("[brain] degraded: probing Claude this turn")
+                first_timeout = _PROBE_FIRST_TIMEOUT
+                if self._client is None:
+                    # degraded since boot: no CLI session yet
+                    try:
+                        await self.start()
+                    except Exception:
+                        pass
+                    if self._client is None:
+                        async for s in self._failover(utterance, "probe: no session"):
+                            yield s
+                        return
+        self._last_turn_local = False
         self._dirty = True             # in flight until its ResultMessage
         think_buf = ""                 # summarized reasoning, logged never spoken
 
@@ -770,14 +934,14 @@ class WarmBrain:
                 try:
                     if _first:
                         msg = await asyncio.wait_for(
-                            _it.__anext__(), _STREAM_FIRST_TIMEOUT)
+                            _it.__anext__(), first_timeout)
                     else:
                         msg = await _it.__anext__()
                 except StopAsyncIteration:
                     break
                 except asyncio.TimeoutError as te:
                     raise TimeoutError(
-                        f"no first SDK message in {_STREAM_FIRST_TIMEOUT}s "
+                        f"no first SDK message in {first_timeout}s "
                         "- the CLI session looks dead (expired sign-in?)"
                     ) from te
                 _first = False
@@ -868,6 +1032,14 @@ class WarmBrain:
                         for tail in split.flush():
                             _spoke_any = True
                             yield tail
+                        if self._local and _is_outage(status, errs):
+                            # TRIGGER 1: the API itself is down, limited,
+                            # or unreachable -> this turn goes local.
+                            async for line in self._failover(
+                                    utterance, f"HTTP {status}" if status
+                                    else (errs[:60] or "error result")):
+                                yield line
+                            break
                         yield ("Something went wrong on my end and the "
                                "turn came back empty. If this keeps up, "
                                "my command-line session may need to sign "
@@ -878,6 +1050,13 @@ class WarmBrain:
                             yield tail
                         if not _spoke_any:
                             yield "I got nothing back that time. Ask me again."
+                    if self._local and self.degraded \
+                            and not getattr(msg, "is_error", False):
+                        # a clean cloud turn while degraded = the probe
+                        # succeeded: Claude answered this one, release
+                        # the local brain
+                        await self._leave_degraded()
+                        yield "And Claude's back, so I'm off the local brain."
                     break
         except GeneratorExit:
             raise
@@ -889,8 +1068,17 @@ class WarmBrain:
             log(f"[brain] stream died: {type(e).__name__}: {str(e)[:160]}")
             for tail in split.flush():
                 yield tail
-            async for line in self._recover(type(e).__name__):
+            # TRIGGER 2: no first message at all = the CLI can't reach
+            # the API (network gone, sign-in dead). Rebuild the session
+            # quietly and answer this turn locally. Any other transport
+            # death (an oversized tool result) is not an outage and keeps
+            # the spoken recovery exactly as before.
+            outage = self._local is not None and isinstance(e, TimeoutError)
+            async for line in self._recover(type(e).__name__, quiet=outage):
                 yield line
+            if outage:
+                async for line in self._failover(utterance, "TimeoutError"):
+                    yield line
             return
         for tail in split.close():
             yield tail

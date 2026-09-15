@@ -119,10 +119,18 @@ def _compact_discipline(name: str, roots: list[str]) -> str:
     # basename alone came back as a relative prefix that had to be guessed
     # at. The prompt is never spoken, so the path rule doesn't apply here.
     folders = "; ".join(roots)
+    # Wording matters here more than usual: an early draft said "you are
+    # running on a small local model ... if asked, say so plainly" and
+    # the 8B model leaned on it as an excuse -- "capital of France?" got
+    # "I'm on a small local model so I don't have much information"
+    # (live, 2026-09-15). Now: answer first, mention the backup only if
+    # asked about it.
     return (
-        f"You are {name}, a voice assistant. You are running on a small "
-        "local model because the main assistant is unreachable right "
-        "now; if asked, say so plainly. Your reply is spoken aloud by a "
+        f"You are {name}, a voice assistant. Answer questions directly "
+        "and confidently from what you know. You happen to be the backup "
+        "brain today, but that's only worth mentioning if someone asks "
+        "what you are or why you seem different; never use it as a "
+        "reason not to answer. Your reply is spoken aloud by a "
         "text-to-speech engine: write like you talk, contractions and "
         "short sentences, a few sentences at most. No markdown, no "
         "lists, no emoji, no URLs. If you must show a file's contents, "
@@ -182,8 +190,13 @@ class LocalBrain:
                         "ab", buffering=0)
             kw = {}
             if os.name == "nt":
+                # NOT DETACHED_PROCESS: a `powershell -File` launcher with
+                # no console exits at once with code 0 and never starts
+                # the server (measured 2026-09-15). No-window + own
+                # process group runs it invisibly and lets stop_server's
+                # taskkill /T take the whole tree down.
                 kw["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
-                                       | subprocess.DETACHED_PROCESS)
+                                       | subprocess.CREATE_NO_WINDOW)
             else:
                 kw["start_new_session"] = True
             log(f"[local] starting server: {self.start_cmd[:120]}")
@@ -432,12 +445,41 @@ class LocalBrain:
         signals.transcript("tool-result", _squish(out, 200))
         return out
 
+    @staticmethod
+    def _nearest_existing(p: str) -> tuple[str | None, list[str]]:
+        """A small model guesses names: wrong case, wrong extension
+        ("Active Priorities.txt" for a .md, seen live 2026-09-15). If the
+        exact path is missing, look in the same folder for a name that
+        matches case-insensitively, then for the same stem with any
+        extension. One match -> use it. Several -> hand them back so the
+        model can pick. Never leaves the folder."""
+        if os.path.isfile(p):
+            return p, []
+        d, want = os.path.dirname(p), os.path.basename(p)
+        if not os.path.isdir(d):
+            return None, []
+        names = [n for n in os.listdir(d) if os.path.isfile(os.path.join(d, n))]
+        ci = [n for n in names if n.lower() == want.lower()]
+        if len(ci) == 1:
+            return os.path.join(d, ci[0]), []
+        stem = os.path.splitext(want)[0].lower()
+        same_stem = [n for n in names if os.path.splitext(n)[0].lower() == stem]
+        if len(same_stem) == 1:
+            return os.path.join(d, same_stem[0]), []
+        return None, sorted(same_stem or ci)[:8]
+
     def _read(self, a) -> str:
         p = self._fence(str(a.get("file_path", "")))
         if not p:
             return "Error: that file is outside the folders you may read."
-        if not os.path.isfile(p):
-            return "Error: no such file."
+        hit, near = self._nearest_existing(p)
+        if not hit:
+            if near:
+                return ("Error: no such file. Did you mean one of: "
+                        + ", ".join(near) + "?")
+            return ("Error: no such file. Use Glob with a pattern like "
+                    "**/*name* to find the exact filename.")
+        p = hit
         with open(p, encoding="utf-8", errors="replace") as f:
             text = f.read(_READ_CHAR_LIMIT + 1)
         if len(text) > _READ_CHAR_LIMIT:

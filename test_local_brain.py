@@ -253,6 +253,22 @@ def test_fence_rejects_traversal(fake, root):
     assert b._fence(os.path.basename(root) + "/../inside.txt") == os.path.join(root, "inside.txt")
 
 
+def test_read_forgives_wrong_case_and_extension(fake, root):
+    b = make(fake, root)
+    with open(os.path.join(root, "Active Priorities.md"), "w") as f:
+        f.write("NEXT UP: x")
+    assert "NEXT UP" in b._read({"file_path": os.path.join(root, "Active Priorities.txt")})
+    assert "NEXT UP" in b._read({"file_path": os.path.join(root, "active priorities.md")})
+    assert "NEXT UP" in b._read({"file_path": "Active Priorities"})
+    # ambiguous stem -> a "did you mean" list, not a guess
+    with open(os.path.join(root, "Active Priorities.txt"), "w") as f:
+        f.write("other")
+    out = b._read({"file_path": os.path.join(root, "Active Priorities.json")})
+    assert out.startswith("Error: no such file. Did you mean") and ".md" in out and ".txt" in out
+    # nothing similar -> steer the model to Glob
+    assert "Glob" in b._read({"file_path": os.path.join(root, "nothing-like-it.md")})
+
+
 def test_fence_resolves_relative_shapes_a_small_model_produces(fake, root):
     b = make(fake, root)
     want = os.path.join(root, "Active Priorities.md")
