@@ -253,6 +253,43 @@ DEFAULTS = {
     # CLAUDE.md covers the character. Use this for a note that belongs to
     # neither, e.g. a rule that only applies when it is speaking.
     "discipline_append": "",
+    # OPTIONAL break-glass local brain: when the Claude API is down,
+    # rate-limited, or the CLI can't reach it, hand the turn to a small
+    # local model served over an OpenAI-compatible endpoint (llama.cpp's
+    # llama-server is the tested one, with Llama 3.1 8B Instruct). Off by
+    # default; with "enabled": false nothing else in this block is read
+    # and the brain's code path is unchanged. This is degrade-never-mute
+    # for the BRAIN, the same way Kokoro is for the voice -- not a second
+    # assistant: no memory, no skills, no MCP, a handful of file tools,
+    # and an 8K context. Expect it to be slower and dumber; it's there so
+    # an outage leaves you with a voice line, not a dead one.
+    "local_fallback": {
+        "enabled": False,
+        # Base URL of the OpenAI-compatible server.
+        "url": "http://127.0.0.1:8080",
+        # Model name to send; llama-server ignores it unless --alias is
+        # set, other servers may route on it.
+        "model": "llama-3.1-8b-instruct",
+        # Command that starts the server, launched on the FIRST failover
+        # (not at boot: the model holds several GB of VRAM the rest of the
+        # day would rather have). "" = never start it, only use it if it
+        # is already answering.
+        "start_cmd": "",
+        # Seconds to wait for the server to answer /health after
+        # start_cmd; the first degraded turn waits this long at most.
+        "start_timeout_s": 45,
+        # Stop a server WE started once Claude is back, to free the VRAM.
+        "stop_when_recovered": True,
+        # While degraded, try Claude again first every Nth turn; success
+        # flips back. 0 = never probe (stay local until restart).
+        "retry_cloud_every_n_turns": 3,
+        # Route EVERY turn to the local brain, for testing the path
+        # without pulling the network cable. Never leave this on.
+        "force": False,
+        # Tool rounds per turn before the local model is cut off and
+        # told to answer with what it has.
+        "max_tool_rounds": 6,
+    },
 }
 
 # The spoken-delivery discipline — the MEDIUM half of what used to be a
