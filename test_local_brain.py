@@ -42,6 +42,18 @@ def tool_reply(name, args: dict, call_id="call_1"):
                                   "function": {"arguments": a[3:]}}]}])
 
 
+def reasoning_reply(thoughts, answer="", finish="stop"):
+    """A thinking model's stream: reasoning arrives as delta.reasoning_content
+    (separate from the spoken delta.content), then a final chunk carries the
+    finish_reason -- "length" means the token cap cut it off."""
+    evs = [{"role": "assistant"}] + [{"reasoning_content": t} for t in thoughts]
+    if answer:
+        evs.append({"content": answer})
+    final = "data: " + json.dumps({"choices": [{"index": 0, "delta": {},
+                                                "finish_reason": finish}]})
+    return _sse(evs).decode().replace("data: [DONE]", final + "\ndata: [DONE]").encode()
+
+
 PEG_500 = (500, b'{"error":{"code":500,"message":"The model produced output '
                 b'that does not match the expected peg-native format"}}')
 
@@ -164,6 +176,35 @@ def test_other_error_speaks_one_line(fake, root):
     fake.queue = [(503, b"down")]
     out = run(make(fake, root), "hi")
     assert len(out) == 1 and "isn't answering" in out[0]
+
+
+def test_reasoning_goes_to_chatbox_not_speech(fake, root, monkeypatch):
+    seen = []
+    monkeypatch.setattr("backtalk.local_brain.signals.transcript",
+                        lambda role, text: seen.append((role, text)))
+    fake.queue = [reasoning_reply(
+        ["The user wants a fifth. ", "Compute 240 * 0.2 = 48.\n", "trailing bit"],
+        "It's forty eight.")]
+    out = run(make(fake, root), "what's a fifth of 240?")
+    assert out == ["It's forty eight."]                       # spoken: the answer only
+    assert [t for r, t in seen if r == "thinking"] == [       # shown: the reasoning
+        "The user wants a fifth.", "Compute 240 * 0.2 = 48.", "trailing bit"]
+    assert not any("fifth" in s or "trailing" in s for s in out)
+
+
+def test_empty_reply_from_token_cap_speaks_a_line(fake, root):
+    # all reasoning, no answer, cut off by max_tokens -> one spoken line, not silence
+    fake.queue = [reasoning_reply(["Let me multiply digit by digit. "] * 3, "", "length")]
+    brain = make(fake, root)
+    out = run(brain, "calculate 1234 times 5678")
+    assert len(out) == 1 and "lost thinking" in out[0]
+    assert brain._history[-1] == {"role": "assistant", "content": out[0]}
+
+
+def test_empty_reply_without_length_is_not_flagged(fake, root):
+    # a normal stop with no text isn't the token-cap case; no invented apology
+    fake.queue = [reasoning_reply(["Nothing to say."], "", "stop")]
+    assert run(make(fake, root), "hi") == []
 
 
 def test_tool_round_cap(fake, root):

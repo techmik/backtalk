@@ -46,7 +46,7 @@ from backtalk.vlog import log
 
 # Reused from the SDK brain so both paths split speech from code the same
 # way and describe tool calls on the bus with the same words.
-from backtalk.brain import _StreamSplitter, _squish, _tool_summary
+from backtalk.brain import _StreamSplitter, _drain_think, _squish, _tool_summary
 
 # Tool output caps: everything a tool returns goes straight back into an
 # 8K-token context. Mirrors brain._BASH_OUTPUT_CHAR_LIMIT in spirit.
@@ -262,9 +262,12 @@ class LocalBrain:
 
     async def _request(self, with_tools: bool):
         """One streamed chat completion. Returns (text_chunks_iter) as an
-        async generator of ("text", str) / ("tool_calls", list) /
-        ("error", str) events. Tool-call argument fragments are stitched
-        by index the way the OpenAI stream format delivers them."""
+        async generator of ("text", str) / ("thinking", str) /
+        ("finish", str) / ("tool_calls", list) / ("error", str) events.
+        "thinking" is the model's reasoning (llama-server streams it as
+        delta.reasoning_content, separate from the spoken text); "finish"
+        is the stream's finish_reason. Tool-call argument fragments are
+        stitched by index the way the OpenAI stream format delivers them."""
         body = {
             "model": self.model,
             "messages": self._messages(),
@@ -294,8 +297,12 @@ class LocalBrain:
                     continue
                 choice = (obj.get("choices") or [{}])[0]
                 delta = choice.get("delta") or {}
+                if delta.get("reasoning_content"):
+                    yield ("thinking", delta["reasoning_content"])
                 if delta.get("content"):
                     yield ("text", delta["content"])
+                if choice.get("finish_reason"):
+                    yield ("finish", choice["finish_reason"])
                 for tc in delta.get("tool_calls") or []:
                     i = tc.get("index", 0)
                     slot = calls.setdefault(i, {"id": tc.get("id") or f"call_{i}",
@@ -328,18 +335,35 @@ class LocalBrain:
             text = ""
             tool_calls = None
             error = None
+            finish = None
+            think_buf = ""
             try:
                 async for kind, val in self._request(with_tools):
                     if kind == "text":
                         text += val
                         for s in split.feed(val):
                             yield s
+                    elif kind == "thinking":
+                        # Screen-only, like the SDK path's thinking blocks:
+                        # rides the transcript bus as its own "thinking" role
+                        # and is never yielded, so the mouth never speaks it.
+                        think_buf += val
+                        segs, think_buf = _drain_think(think_buf)
+                        for seg in segs:
+                            log(f"[think] {seg}")
+                            signals.transcript("thinking", seg)
+                    elif kind == "finish":
+                        finish = val
                     elif kind == "tool_calls":
                         tool_calls = val
                     else:
                         error = val
             except Exception as e:
                 error = f"{type(e).__name__}: {str(e)[:160]}"
+            if think_buf.strip():
+                seg = think_buf.strip()
+                log(f"[think] {seg}")
+                signals.transcript("thinking", seg)
             if error:
                 if _PEG_500 in error and with_tools:
                     # The model invented a function name and llama.cpp
@@ -353,6 +377,18 @@ class LocalBrain:
                     yield s
                 yield ("The local brain isn't answering either. "
                        "Try me again in a moment.")
+                return
+            if not tool_calls and not text.strip() and finish == "length":
+                # A thinking model spent the whole token budget on reasoning
+                # and never got to the answer (seen live on multi-digit
+                # arithmetic). Say so instead of going silent.
+                log("[local] empty reply: reasoning used the whole token budget")
+                for s in split.close():
+                    yield s
+                line = ("I got lost thinking that one through. "
+                        "Try asking it another way.")
+                self._history.append({"role": "assistant", "content": line})
+                yield line
                 return
             if not tool_calls:
                 break
