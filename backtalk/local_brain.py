@@ -56,7 +56,11 @@ _RESULT_CHAR_LIMIT = 1500
 # and never more than this many characters of them.
 _HISTORY_MSGS = 12
 _HISTORY_CHARS = 18000
-_MAX_TOKENS = 500
+# Gemma 4 thinks before it answers and hidden reasoning tokens count against
+# this cap: at 500 a multi-digit multiplication came back EMPTY (reasoning
+# ate the whole budget, finish_reason=length); it needed ~1000. The context
+# is only 8K and can't grow (VRAM), so this leaves ~6K for the prompt.
+_MAX_TOKENS = 2048
 _PEG_500 = "peg-native format"
 
 
