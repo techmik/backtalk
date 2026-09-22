@@ -54,6 +54,9 @@ DEFAULTS = {
     # lasts one session and is always spoken; this default never moves
     # by itself.
     "deep_model": "claude-opus-5",
+    # The "switch to sonnet" voice command's target (runs at high effort,
+    # session only). Full id ON PURPOSE, same reasoning as "model".
+    "sonnet_model": "claude-sonnet-5",
     # Tool permissions for the voice session. "ask" is the default ON
     # PURPOSE (safety is opt-out, never opt-in): when the agent wants a
     # gated tool (write a file, run a real command), it ASKS OUT LOUD
@@ -327,7 +330,8 @@ DISCIPLINE = (
     "asking for permission' (then 'confirm'), or 'start asking "
     "again'. Microphone: 'go hands free', or 'push to talk mode'. "
     "Also: 'clear the session', 'compact the session', 'switch to "
-    "the deep model', 'back to the fast model', 'set effort to low' "
+    "the deep model', 'switch to sonnet' (Sonnet at high effort), "
+    "'back to the default model', 'set effort to low' "
     "(or medium, high, max), 'usage report', and 'switch audio "
     "output' (moves the spoken voice to the current default output "
     "device, for hot-swapping earbuds and speakers). You cannot flip "

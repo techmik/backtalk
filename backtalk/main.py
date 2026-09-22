@@ -27,8 +27,9 @@ spoken reply, and typing while it talks interrupts it.
 
 THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
 session itself so you never go back to the keyboard: "clear the
-session" / "compact the session" / "switch to the deep model" / "back
-to the fast model" / "set effort to low" (or medium, high, max) /
+session" / "compact the session" / "switch to the deep model" /
+"switch to sonnet" (Sonnet, high effort) / "back to the default model"
+/ "set effort to low" (or medium, high, max) /
 "usage report" / "go hands free" and "push to talk mode" (the MIC) /
 "switch audio output" (move the voice to the current default output
 device, for hot-swapping earbuds and speakers mid-session) / "stop
@@ -369,7 +370,11 @@ CONSOLE_VERBS = {
     "deep":      ("switch to the deep model", "use the deep model",
                   "slash model deep"),
     "fast":      ("switch to the fast model", "use the fast model",
-                  "back to the fast model", "slash model fast"),
+                  "back to the fast model", "slash model fast",
+                  "back to the default model", "switch to opus",
+                  "back to opus"),
+    "sonnet":    ("switch to sonnet", "use sonnet",
+                  "switch to the sonnet model", "slash model sonnet"),
     "usage":     ("usage report", "slash usage"),
     "micopen":   ("go hands free", "hands free mode",
                   "hands free listening", "open mic", "open the mic"),
@@ -905,13 +910,19 @@ async def amain():
             say_after = "Compacted. Same conversation, smaller footprint."
         elif verb == "deep":
             mouth.say("Switching to the deep model. Heads up, replies "
-                      "get slower. Say back to the fast model when "
+                      "get slower. Say back to the default model when "
                       "you're done.")
             resp = await brain.command(f"/model {CFG['deep_model']}")
             say_after = "Deep model online, for this session only."
         elif verb == "fast":
             resp = await brain.command(f"/model {CFG['model']}")
-            say_after = "Back on the fast model."
+            say_after = "Back on the default model."
+        elif verb == "sonnet":
+            resp = await brain.command(f"/model {CFG['sonnet_model']}")
+            low = (resp or "").lower()
+            if not ("error" in low or "invalid" in low):
+                resp = await brain.command("/effort high")
+            say_after = "Sonnet online, high effort, for this session only."
         elif verb.startswith("effort:"):
             lvl = verb.split(":", 1)[1]
             resp = await brain.command(f"/effort {lvl}")
