@@ -207,6 +207,28 @@ def test_char_by_char_abbrev_parity():
                             "It went fine."]
 
 
+def test_backticked_slash_list_is_spoken():
+    # 2026-09-22: a list of alternatives was mistaken for a file path and
+    # the sentence (the agent's actual question) never reached the mouth.
+    line = ("Should it touch the real `model`/`deep_model`/`sonnet_model` "
+            "defaults?")
+    spoken, blocks, _ = run([line])
+    assert spoken == [line] and blocks == []
+
+
+def test_backticked_real_path_still_goes_to_screen():
+    line = "Edit `backtalk/backtalk/main.py` next."
+    spoken, blocks, _ = run([line])
+    assert spoken == [] and blocks == [line]
+
+
+def test_list_and_real_path_in_one_sentence_goes_to_screen():
+    line = ("Touch `backtalk/backtalk/main.py` in the `deep`/`fast`/`sonnet` "
+            "branches.")
+    spoken, blocks, _ = run([line])
+    assert spoken == [] and blocks == [line]
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

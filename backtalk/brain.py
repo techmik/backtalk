@@ -206,12 +206,18 @@ _PATHLIKE = re.compile(r"[^\s/\\]+[/\\][^\s/\\]+[/\\][^\s]*")
 # ratio ("24/7/365"), which the model is right to speak. Found 2026-09-04:
 # the daily spoken recap's calendar line was being diverted to the screen.
 _NUMERIC_PATH = re.compile(r"[\d.,/\\]+")
+# A slash BETWEEN two backticked words ("`model`/`deep_model`") is a list
+# of alternatives, not a path. Found 2026-09-22: such a list hid the very
+# question the agent was asking. A real path keeps its slashes inside one
+# backtick pair ("`backtalk/backtalk/main.py`"), so it still reads as a path.
+_TICK_LIST_SEP = re.compile(r"`\s*/\s*`")
 _UNSPEAKABLE_LEN = 400
 
 
 def _looks_unspeakable(s: str) -> bool:
     if len(s) > _UNSPEAKABLE_LEN:
         return True
+    s = _TICK_LIST_SEP.sub("` `", s)
     return any(not _NUMERIC_PATH.fullmatch(m) for m in _PATHLIKE.findall(s))
 
 
