@@ -134,6 +134,14 @@ _OUTAGE_HINTS = ("overloaded", "rate limit", "rate_limit", "usage limit",
                  "unauthorized")
 
 
+# Opus-tier safety classifiers can block a normal turn (a false positive —
+# seen 2026-09-22, category reasoning_extraction, right after reading a
+# chatbox screenshot). The CLI reports it as a synthetic assistant text
+# containing this phrase; the block persists for every later turn in the
+# same session. Recovery per the error itself: change the model.
+_SAFETY_FLAG = "safeguards flagged"
+
+
 def _is_outage(status, errs: str) -> bool:
     if status in _OUTAGE_STATUSES:
         return True
@@ -415,6 +423,9 @@ class WarmBrain:
         # resolves aliases through its own bundled CLI and can silently
         # land on an older model.
         self.model = model or CFG["model"]
+        # What the session is actually on now — console /model switches
+        # (deep / sonnet / default) move it; self.model stays the launch pick.
+        self._live_model = self.model
         # The spoken permission gate (main.py builds it). Wired at
         # connect in EVERY mode, so a live mode flip needs no reconnect;
         # bypass simply never consults it.
@@ -752,7 +763,12 @@ class WarmBrain:
         # /clear and /compact move the context floor a lot — refresh the
         # readout now rather than waiting for the next spoken turn.
         await self._publish_context()
-        return " ".join(texts).strip()
+        out = " ".join(texts).strip()
+        low = out.lower()
+        if cmd.startswith("/model ") and not ("error" in low
+                                              or "invalid" in low):
+            self._live_model = cmd.split(None, 1)[1].strip()
+        return out
 
     async def interrupt(self):
         # A cancelled local turn has nothing in the SDK pipe to stop.
@@ -879,7 +895,7 @@ class WarmBrain:
             yield ("I lost my connection and couldn't get it back. "
                    "Restart me when you get a chance.")
 
-    async def ask_stream(self, utterance: str):
+    async def ask_stream(self, utterance: str, _retried: bool = False):
         """Yield complete sentences as they stream out of the model."""
         first_timeout = _STREAM_FIRST_TIMEOUT
         if self._local:
@@ -922,6 +938,8 @@ class WarmBrain:
         split = _StreamSplitter(_emit_code)
         self._turn_had_code = False
         _spoke_any = False
+        _flagged = False               # safety classifier blocked this turn
+        retry_on_sonnet = False
         try:
             await self._client.query(utterance)
             _it = self._client.receive_response().__aiter__()
@@ -994,6 +1012,8 @@ class WarmBrain:
                     # dashboard shows the activity like the desktop app's
                     # verbose view.
                     for b in getattr(msg, "content", []) or []:
+                        if _SAFETY_FLAG in (getattr(b, "text", None) or ""):
+                            _flagged = True
                         if type(b).__name__ in ("ToolUseBlock",
                                                 "ServerToolUseBlock"):
                             line = _tool_summary(getattr(b, "name", "?"),
@@ -1023,7 +1043,24 @@ class WarmBrain:
                     self._remember_session(msg)
                     await self._pull_rate_limits()
                     await self._publish_context()
-                    if getattr(msg, "is_error", False):
+                    _flagged = (_flagged
+                                or getattr(msg, "stop_reason", None) == "refusal"
+                                or _SAFETY_FLAG in (getattr(msg, "result", None)
+                                                    or ""))
+                    if _flagged:
+                        log(f"[brain] safety classifier blocked the turn "
+                            f"(model={self._live_model}, stop_reason="
+                            f"{getattr(msg, 'stop_reason', None)})")
+                        for tail in split.flush():
+                            _spoke_any = True
+                            yield tail
+                        if (not _retried
+                                and self._live_model != CFG["sonnet_model"]):
+                            retry_on_sonnet = True
+                        else:
+                            yield ("The safety filter flagged that again. "
+                                   "Say clear the session to start fresh.")
+                    elif getattr(msg, "is_error", False):
                         errs = "; ".join(getattr(msg, "errors", None) or [])
                         status = getattr(msg, "api_error_status", None)
                         log("[brain] turn returned an error"
@@ -1082,6 +1119,19 @@ class WarmBrain:
             return
         for tail in split.close():
             yield tail
+        if retry_on_sonnet:
+            yield ("Opus's safety filter flagged that, probably a false "
+                   "positive. Switching to Sonnet for this session and "
+                   "trying again.")
+            resp = (await self.command(f"/model {CFG['sonnet_model']}")).lower()
+            if "error" in resp or "invalid" in resp:
+                log(f"[brain] auto-switch to Sonnet failed: {resp[:120]}")
+                yield ("I couldn't switch to Sonnet. Say clear the session "
+                       "to start fresh.")
+                return
+            await self.command("/effort high")
+            async for s in self.ask_stream(utterance, _retried=True):
+                yield s
 
 
 if __name__ == "__main__":
