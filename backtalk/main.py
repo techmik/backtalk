@@ -113,6 +113,18 @@ _AUTOAPPROVE = {"on": False}
 # processed.
 _MIC = {"mode": "ptt", "gen": 0, "btn": False}
 
+
+def _publish_modes():
+    """Push the live permission + mic modes to the bus (.voice_session),
+    so a face shows what the session is ACTUALLY on after a spoken flip,
+    not the launch config. Never raises (signals never do)."""
+    if _AUTOAPPROVE["on"]:
+        mode = "bypassPermissions"
+    else:
+        m = CFG.get("permission_mode") or "ask"
+        mode = "ask" if m in ("default", "bypassPermissions") else m
+    signals.set_session(mode=mode, mic=_MIC["mode"])
+
 # Approvals are EXACT matches after normalization, never prefixes:
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
 # fail. Anything that is not an exact yes DENIES, with the words passed
@@ -322,6 +334,7 @@ def make_permission_gate(mouth):
                     saved = _write_config_key("permission_mode",
                                               "bypassPermissions")
                     _AUTOAPPROVE["on"] = True
+                    _publish_modes()
                     log("[console] permission_mode -> bypassPermissions"
                         + (" (saved)" if saved else " (session only)")
                         + " [flipped mid-ask]")
@@ -868,6 +881,14 @@ async def amain():
                   "backup brain until it's back. Slower and dumber, but here.")
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
+    # The live-session readout starts clean here, after the warmup, so a
+    # face never shows the previous run's state or the warmup's cost. The
+    # boot effort command just below publishes effort on its own.
+    signals.session_reset(model=brain._live_model, effort="",
+                          degraded=bool(getattr(brain, "degraded", False)),
+                          **({"turns": 0, "cost": 0.0}
+                             if CFG.get("show_usage") else {}))
+    _publish_modes()
     # a configured effort level applies at launch (saved by the spoken
     # "set effort to X", or written by the person's agent on request)
     boot_effort = str(CFG.get("effort") or "").strip().lower()
@@ -896,6 +917,8 @@ async def amain():
             log(f"[console] {verb} failed: {e}")
             mouth.say("That command hit an error. Check the log.")
             signals.set_state("idle")
+        finally:
+            _publish_modes()   # any verb may have flipped mode or mic
 
     async def _run_console_inner(verb):
         _deny_pending()

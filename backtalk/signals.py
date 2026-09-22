@@ -29,6 +29,13 @@ is the whole integration surface:
                         written when show_usage is on
   .voice_context        JSON {used, max, pct} — context-window fill after
                         the latest turn (always written; not spend data)
+  .voice_session        JSON {ts, model, effort, mode, mic, degraded,
+                        [turns, cost]} — what the session is LIVE on right
+                        now, rewritten on every change (a spoken model or
+                        effort switch, a permission/mic flip, a failover).
+                        backtalk.json only knows the launch defaults; this
+                        is the file that follows runtime switches. turns and
+                        cost appear only when show_usage is on.
   .voice_permission     JSON {ts, id, tool, what, detail} — present ONLY
                         while a permission ask is waiting for an answer.
                         Removed the instant the ask resolves (any path:
@@ -79,6 +86,7 @@ _TRANSCRIPT_FILE = os.path.join(_DIR, ".voice_transcript.jsonl")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _CONTEXT_FILE = os.path.join(_DIR, ".voice_context")
 _PERMISSION_FILE = os.path.join(_DIR, ".voice_permission")
+_SESSION_FILE = os.path.join(_DIR, ".voice_session")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -235,6 +243,31 @@ def set_context(used_tokens, max_tokens, pct=None):
             f.write(json.dumps({"used": used_tokens, "max": max_tokens,
                                 "pct": pct}))
     except (OSError, TypeError, ZeroDivisionError):
+        pass
+
+
+_session: dict = {}
+
+
+def session_reset(**fields):
+    """Start the live-session readout fresh at launch, so a face never
+    shows the previous run's model or cost. Never raises."""
+    _session.clear()
+    set_session(**fields)
+
+
+def set_session(**fields):
+    """Merge fields into the live-session readout and rewrite the file.
+
+    Merged like set_rate_limit: model, effort, mode and mic each change
+    from a different place (brain.command, the console verbs, the
+    permission gate), and a face wants the whole picture at once. Never
+    raises."""
+    _session.update(fields)
+    try:
+        with open(_SESSION_FILE, "w") as f:
+            f.write(json.dumps(dict(_session, ts=time.time())))
+    except (OSError, TypeError, ValueError):
         pass
 
 

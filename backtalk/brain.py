@@ -581,12 +581,14 @@ class WarmBrain:
         self._degraded_turns = 0
         log("[brain] DEGRADED: Claude unreachable, answering on the local brain")
         signals.transcript("system", "Claude unreachable -- switched to the local brain")
+        signals.set_session(degraded=True)
 
     async def _leave_degraded(self):
         self.degraded = False
         self._degraded_turns = 0
         log("[brain] recovered: Claude is answering again")
         signals.transcript("system", "Claude is back -- local brain released")
+        signals.set_session(degraded=False)
         self._local.reset()
         if self._lf.get("stop_when_recovered", True):
             self._local.stop_server()
@@ -664,6 +666,10 @@ class WarmBrain:
             c = getattr(rm, "total_cost_usd", None)
             if c:
                 s["cost"] += float(c)
+            # Spend, so gated exactly like the rate-limit readout.
+            if CFG.get("show_usage"):
+                signals.set_session(turns=s["turns"],
+                                    cost=round(s["cost"], 4))
         except Exception:
             pass
 
@@ -771,9 +777,12 @@ class WarmBrain:
         await self._publish_context()
         out = " ".join(texts).strip()
         low = out.lower()
-        if cmd.startswith("/model ") and not ("error" in low
-                                              or "invalid" in low):
-            self._live_model = cmd.split(None, 1)[1].strip()
+        if not ("error" in low or "invalid" in low):
+            if cmd.startswith("/model "):
+                self._live_model = cmd.split(None, 1)[1].strip()
+                signals.set_session(model=self._live_model)
+            elif cmd.startswith("/effort "):
+                signals.set_session(effort=cmd.split(None, 1)[1].strip())
         return out
 
     async def interrupt(self):
