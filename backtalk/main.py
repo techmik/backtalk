@@ -89,7 +89,8 @@ _STOP = threading.Event()
 # words passed back as the reason. Silence means no.
 PERM_TIMEOUT_S = 75
 _PERM = {"fut": None, "asked_at": 0.0,   # pending ask + when it was posed
-         "hinted": False}                # escape-hatch hint said yet?
+         "hinted": False,                # escape-hatch hint said yet?
+         "gen": 0}                       # bumped per _deny_pending (turn cut)
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
@@ -167,7 +168,10 @@ def _is_quit(text) -> bool:
 def _deny_pending(reason=_INTERRUPT_ANSWER):
     """Resolve a pending spoken ask as a deny. Called whenever the turn
     that posed it is being interrupted, so the ask can never outlive its
-    turn and hijack a later utterance (or stall the pipe drain)."""
+    turn and hijack a later utterance (or stall the pipe drain). Also
+    bumps the generation, so asks still QUEUED behind it (parallel tool
+    calls) deny silently instead of speaking into the next turn."""
+    _PERM["gen"] += 1
     f = _PERM["fut"]
     if f is not None and not f.done():
         f.set_result(reason)
@@ -242,9 +246,30 @@ def make_permission_gate(mouth):
     from claude_agent_sdk import (PermissionResultAllow,
                                   PermissionResultDeny)
 
+    # Parallel tool calls hit the gate concurrently, but there is ONE
+    # pending-answer slot and ONE card file: unserialized, each ask
+    # overwrote the last and a single "yes" approved only the newest
+    # (field case 2026-09-23: 5 parallel WebFetches, 5 asks spoken, one
+    # card, 4 dropped). Asks now queue and are posed one at a time.
+    lock = asyncio.Lock()
+
     async def gate(tool, tool_input, ctx):
         if _AUTOAPPROVE["on"]:
             return PermissionResultAllow(behavior="allow")
+        gen = _PERM["gen"]
+        async with lock:
+            if gen != _PERM["gen"]:
+                log("[perm]   queued ask dropped: turn interrupted")
+                return PermissionResultDeny(
+                    behavior="deny",
+                    message="Interrupted by the user; the turn is being "
+                            "cancelled.",
+                    interrupt=False)
+            if _AUTOAPPROVE["on"]:       # flipped mid-queue
+                return PermissionResultAllow(behavior="allow")
+            return await _ask(tool, tool_input, ctx)
+
+    async def _ask(tool, tool_input, ctx):
         what = _human_what(tool, tool_input, ctx)
         detail = _full_detail(tool, tool_input, ctx)
         loop = asyncio.get_running_loop()
