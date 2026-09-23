@@ -400,6 +400,68 @@ def _tool_summary(name: str, inp: dict) -> str:
         return name or "?"
 
 
+class Progress(str):
+    """A spoken progress line ("Reading the daily note.") yielded mid-turn
+    while a tool runs. A str so every existing consumer still works; the
+    type is the marker main.py uses to speak it NOW (not held for a
+    two-sentence batch, which would leave it silent through the very
+    tool run it exists to cover) and keep it out of the chat transcript,
+    which already shows the tool line."""
+
+
+_DATE_STEM = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _spoken_name(path: str) -> str:
+    """A file path as a few speakable words: extension dropped, _/-
+    turned to spaces. Date-named files are daily notes. "" when the
+    result is too long or odd to say."""
+    stem = os.path.splitext(os.path.basename(str(path or "")))[0]
+    if _DATE_STEM.match(stem):
+        return "the daily note"
+    words = " ".join(re.sub(r"[_\-.]+", " ", stem).split())
+    if not words or len(words) > 40 or not re.search(r"[A-Za-z]", words):
+        return ""
+    return words
+
+
+def _tool_spoken(name: str, inp: dict) -> str | None:
+    """Short spoken line for a tool call, or None to stay silent. Built
+    from the call itself, so it costs no tokens. Never raises."""
+    try:
+        n = name or ""
+        inp = inp or {}
+        if n == "Read":
+            f = _spoken_name(inp.get("file_path", ""))
+            return f"Reading {f}." if f else "Reading a file."
+        if n in ("Edit", "Write", "NotebookEdit"):
+            f = _spoken_name(inp.get("file_path") or inp.get("notebook_path") or "")
+            return f"Updating {f}." if f else "Updating a file."
+        if n in ("Grep", "Glob"):
+            where = str(inp.get("path") or "")
+            return ("Searching the vault." if "vault" in where.lower()
+                    else "Searching the files.")
+        if n.startswith("mcp__") and "qmd" in n:
+            return "Searching the vault."
+        if n == "Bash":
+            d = " ".join(str(inp.get("description") or "").split())
+            if d and len(d) <= 60 and not re.search(r"[\\/`$|<>]", d):
+                return d.rstrip(".") + "."
+            return "Running a command."
+        if n == "WebSearch":
+            return "Searching the web."
+        if n == "WebFetch":
+            return "Pulling up a page."
+        if n == "Skill":
+            s = str(inp.get("skill") or "").split(":")[-1].replace("-", " ").strip()
+            return f"Running the {s} skill." if s else "Running a skill."
+        if n in ("Task", "Agent"):
+            return "Handing that to a helper."
+        return None
+    except Exception:
+        return None
+
+
 def _tool_result_text(block) -> str:
     """Compact result string for the transcript bus (errors flagged).
     Never raises."""
@@ -953,6 +1015,12 @@ class WarmBrain:
         split = _StreamSplitter(_emit_code)
         self._turn_had_code = False
         _spoke_any = False
+        _progress_on = bool(CFG.get("progress_lines"))
+        _gap = CFG.get("progress_gap_s")
+        _progress_gap = float(6 if _gap is None else _gap)
+        _now = asyncio.get_event_loop().time
+        _last_spoken_at = float("-inf")  # first tool of a silent turn speaks
+        _last_progress = ""
         _flagged = False               # safety classifier blocked this turn
         retry_on_sonnet = False
         try:
@@ -988,6 +1056,7 @@ class WarmBrain:
                             # fenced code is siphoned to the transcript bus
                             for sentence in split.feed(delta.get("text", "")):
                                 _spoke_any = True
+                                _last_spoken_at = _now()
                                 yield sentence
                         elif delta.get("type") == "thinking_delta":
                             # Reasoning stream: flush to the log AND the
@@ -1020,6 +1089,7 @@ class WarmBrain:
                         # thoughts at once. Fence state is left intact.
                         for tail in split.flush():
                             _spoke_any = True
+                            _last_spoken_at = _now()
                             yield tail
                 elif t == "AssistantMessage":
                     # Tool calls: surface WHAT the agent does, not just its
@@ -1040,6 +1110,18 @@ class WarmBrain:
                             # turn isn't done just because the model stopped
                             # composing text.
                             signals.set_state("working")
+                            # Spoken progress line: covers the tool run's
+                            # dead air. Gated so it never talks over a
+                            # recent sentence or repeats itself.
+                            if _progress_on:
+                                p = _tool_spoken(getattr(b, "name", ""),
+                                                 getattr(b, "input", {}))
+                                if (p and p != _last_progress
+                                        and _now() - _last_spoken_at >= _progress_gap):
+                                    _last_progress = p
+                                    _last_spoken_at = _now()
+                                    log(f"[progress] {p}")
+                                    yield Progress(p)
                 elif t == "UserMessage":
                     for b in getattr(msg, "content", []) or []:
                         if type(b).__name__ in ("ToolResultBlock",

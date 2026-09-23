@@ -65,7 +65,7 @@ import threading
 import time
 
 from backtalk import signals
-from backtalk.brain import WarmBrain
+from backtalk.brain import Progress, WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -734,6 +734,17 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
 
     def emit(raw: str):
         nonlocal first, batch, pending, sources_started
+        if isinstance(raw, Progress):
+            # Spoken progress line while a tool runs: say it NOW (a held
+            # batch goes first so order holds), never as the "first"
+            # reply sentence, and not into the chat -- the screen already
+            # shows the tool line.
+            if batch:
+                mouth.say_chunk(" ".join(batch), pending)
+                pending = []
+                batch = []
+            mouth.say_chunk(str(raw), [])
+            return
         # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
         # lifted out here, never spoken, and published on the signal bus when
         # this chunk's audio starts (signals.direction). backtalk has no

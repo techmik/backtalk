@@ -245,6 +245,12 @@ DEFAULTS = {
     # a dead line. The bundled one ships in assets/; a relative path
     # resolves against this repo. Set "" to think in silence.
     "thinking_sound": "assets/thinking.wav",
+    # Speak a short line when a tool starts ("Reading the daily note.",
+    # "Searching the web.") so a long tool run isn't dead air. Built from
+    # the tool call itself, no extra tokens. progress_gap_s: at least this
+    # many seconds since anything was last spoken before another one.
+    "progress_lines": False,
+    "progress_gap_s": 6,
     # Spoken lines. {name} is replaced with "name" above.
     "greeting": "Voice line online. Hold {ptt_key} and talk to me.",
     # Spoken instead of "greeting" when mic_mode is "open", where telling
