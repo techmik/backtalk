@@ -251,6 +251,13 @@ DEFAULTS = {
     # many seconds since anything was last spoken before another one.
     "progress_lines": False,
     "progress_gap_s": 6,
+    # Opus 5.5 / Fable 5.1 return the notes the model writes BETWEEN tool
+    # calls ("found X, checking Y next") as thinking blocks, not text, so
+    # they land in the screen-only thinking lane and are never spoken (on
+    # Opus 5 they were text). True: speak a thinking block when a tool call
+    # already ran this turn, the very next block is another tool call, and
+    # the block is two sentences or fewer. Reasoning stays screen-only.
+    "speak_progress_notes": False,
     # Spoken lines. {name} is replaced with "name" above.
     "greeting": "Voice line online. Hold {ptt_key} and talk to me.",
     # Spoken instead of "greeting" when mic_mode is "open", where telling

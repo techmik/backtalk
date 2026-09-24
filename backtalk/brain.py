@@ -237,6 +237,21 @@ def _drain_think(buf: str):
     return out, buf
 
 
+# Progress-note check for speak_progress_notes. Anthropic's docs: each
+# between-tool-call note is its own thinking block, immediately before the
+# tool call it introduces, separate from any reasoning block at that point.
+# Under display "summarized" both kinds arrive as thinking, so position is
+# the tell (checked in ask_stream); length screens out the longer reasoning
+# summaries. Validated 2026-09-24 on claude-opus-5-5: 2/2 notes, 0/2 misfires.
+_NOTE_MAX_SENTENCES = 2
+_NOTE_SENT_END = re.compile(r"[.!?](?:\s|$)")
+
+
+def _is_progress_note(text: str) -> bool:
+    t = text.strip()
+    return bool(t) and len(_NOTE_SENT_END.findall(t)) <= _NOTE_MAX_SENTENCES
+
+
 class _StreamSplitter:
     """Split a streamed text reply into spoken prose and fenced code.
 
@@ -1006,6 +1021,10 @@ class WarmBrain:
         self._last_turn_local = False
         self._dirty = True             # in flight until its ResultMessage
         think_buf = ""                 # summarized reasoning, logged never spoken
+        _notes_on = bool(CFG.get("speak_progress_notes"))
+        _think_block = ""              # whole current thinking block
+        _pending_note = ""             # closed short thinking block, awaiting next block
+        _tool_seen = False             # a tool call already started this turn
 
         def _emit_code(block):
             log(f"[code] block ({len(block)} chars) -> screen only")
@@ -1049,7 +1068,27 @@ class WarmBrain:
                 t = type(msg).__name__
                 if t == "StreamEvent":
                     ev = getattr(msg, "event", {}) or {}
-                    if ev.get("type") == "content_block_delta":
+                    if ev.get("type") in ("content_block_start",
+                                          "message_start"):
+                        cb = ev.get("content_block") or {}
+                        if cb.get("type") in ("tool_use", "server_tool_use"):
+                            # A short thinking block sitting between two tool
+                            # calls is a progress note (Opus 5.5): speak it
+                            # now, before the tool runs. It already showed in
+                            # the thinking lane as it streamed.
+                            if _notes_on and _pending_note and _tool_seen:
+                                log(f"[note] {_pending_note}")
+                                for sentence in split.feed(_pending_note + " "):
+                                    _spoke_any = True
+                                    _last_spoken_at = _now()
+                                    yield sentence
+                                for tail in split.flush():
+                                    _spoke_any = True
+                                    _last_spoken_at = _now()
+                                    yield tail
+                            _tool_seen = True
+                        _pending_note = ""
+                    elif ev.get("type") == "content_block_delta":
                         delta = ev.get("delta", {}) or {}
                         if delta.get("type") == "text_delta":
                             # fence-aware: prose streams out to be spoken,
@@ -1071,11 +1110,17 @@ class WarmBrain:
                             # rides as its own "thinking" role, distinct from
                             # user/assistant, so a dashboard can dim it.
                             think_buf += delta.get("thinking", "")
+                            _think_block += delta.get("thinking", "")
                             segs, think_buf = _drain_think(think_buf)
                             for seg in segs:
                                 log(f"[think] {seg}")
                                 signals.transcript("thinking", seg)
                     elif ev.get("type") == "content_block_stop":
+                        if _think_block:
+                            _pending_note = (_think_block.strip()
+                                             if _is_progress_note(_think_block)
+                                             else "")
+                            _think_block = ""
                         if think_buf.strip():
                             seg = think_buf.strip()
                             log(f"[think] {seg}")
