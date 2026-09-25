@@ -65,7 +65,7 @@ import threading
 import time
 
 from backtalk import signals
-from backtalk.brain import Progress, WarmBrain
+from backtalk.brain import Boundary, Progress, WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -759,6 +759,14 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
 
     def emit(raw: str):
         nonlocal first, batch, pending, sources_started
+        if isinstance(raw, Boundary):
+            # A tool is starting: speak any held sentence now, not after
+            # the tool finishes glued to the next one. Says nothing itself.
+            if batch:
+                mouth.say_chunk(" ".join(batch), pending)
+                pending = []
+                batch = []
+            return
         if isinstance(raw, Progress):
             # Spoken progress line while a tool runs: say it NOW (a held
             # batch goes first so order holds), never as the "first"
@@ -975,6 +983,12 @@ async def amain():
             say_after = "Deep model online, for this session only."
         elif verb == "fast":
             resp = await brain.command(f"/model {CFG['model']}")
+            # "sonnet" also sets /effort high; coming back must restore the
+            # configured effort too, or high sticks for the rest of the session.
+            low = (resp or "").lower()
+            eff = str(CFG.get("effort") or "").strip().lower()
+            if eff in _EFFORTS and not ("error" in low or "invalid" in low):
+                resp = await brain.command(f"/effort {eff}")
             say_after = "Back on the default model."
         elif verb == "sonnet":
             resp = await brain.command(f"/model {CFG['sonnet_model']}")
@@ -1090,9 +1104,13 @@ async def amain():
             low = (resp or "").lower()
             if resp and ("error" in low or "invalid" in low):
                 mouth.say(resp[:160])
+                signals.transcript("assistant", resp[:160])
                 log(f"[console] {verb} answered: {resp[:120]}")
             else:
                 mouth.say(say_after)
+                # show it on screen too -- a voice-only confirmation leaves
+                # the chat with no trace that the switch happened
+                signals.transcript("assistant", say_after)
         signals.set_state("idle")
 
     async def handle(text: str, spoke_from: float | None = None) -> bool:

@@ -424,6 +424,15 @@ class Progress(str):
     which already shows the tool line."""
 
 
+class Boundary(str):
+    """Empty marker yielded when a tool starts and no Progress line was
+    spoken for it. Says nothing itself; main.py uses it to speak whatever
+    sentence is still held in its two-sentence batch NOW, before the tool
+    runs -- otherwise an odd leftover sentence waits through the whole
+    tool run and comes out glued to the next one. An empty str, so a
+    consumer that doesn't know the type just skips it."""
+
+
 _DATE_STEM = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -1158,6 +1167,7 @@ class WarmBrain:
                             # Spoken progress line: covers the tool run's
                             # dead air. Gated so it never talks over a
                             # recent sentence or repeats itself.
+                            _said = False
                             if _progress_on:
                                 p = _tool_spoken(getattr(b, "name", ""),
                                                  getattr(b, "input", {}))
@@ -1166,7 +1176,12 @@ class WarmBrain:
                                     _last_progress = p
                                     _last_spoken_at = _now()
                                     log(f"[progress] {p}")
+                                    _said = True
                                     yield Progress(p)
+                            if not _said:
+                                # a Progress already flushes main.py's held
+                                # batch; without one, say so explicitly
+                                yield Boundary()
                 elif t == "UserMessage":
                     for b in getattr(msg, "content", []) or []:
                         if type(b).__name__ in ("ToolResultBlock",

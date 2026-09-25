@@ -88,9 +88,12 @@ def make(fake, client_turns=(), *, enabled=True, n=3, force=False):
     return b
 
 
-def turn(b, text="hi"):
+def turn(b, text="hi", keep_boundaries=False):
+    # Boundary markers are empty and never spoken; drop them by default so
+    # tests compare what would actually be said.
     async def go():
-        return [s async for s in b.ask_stream(text)]
+        return [s async for s in b.ask_stream(text)
+                if keep_boundaries or type(s).__name__ != "Boundary"]
     return asyncio.run(go())
 
 

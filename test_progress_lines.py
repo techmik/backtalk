@@ -144,3 +144,34 @@ def test_progress_does_not_count_as_a_reply(fake, monkeypatch):
 
 def test_brain_module_exports_progress():
     assert issubclass(brain_mod.Progress, str)
+
+
+# ------------------------------------------------------------------ boundary
+
+def test_boundary_when_progress_suppressed(fake, monkeypatch):
+    # a recent sentence gates the progress line -> a Boundary is yielded
+    # instead, so main.py can speak any held sentence before the tool runs
+    _on(monkeypatch, gap=6)
+    b = make(fake, [[StreamEvent("Let me check. "), block_stop(),
+                     tool("Read", file_path="/a/One.md"),
+                     StreamEvent("Done. "), ResultMessage()]], enabled=False)
+    out = turn(b, keep_boundaries=True)
+    kinds = [type(s).__name__ for s in out]
+    assert "Boundary" in kinds and "Progress" not in kinds
+    assert kinds.index("Boundary") < out.index("Done.")
+
+
+def test_boundary_when_progress_off(fake, monkeypatch):
+    monkeypatch.setitem(CFG, "progress_lines", False)
+    b = make(fake, [[tool("Read", file_path="/a.md"),
+                     StreamEvent("Done. "), ResultMessage()]], enabled=False)
+    out = turn(b, keep_boundaries=True)
+    assert isinstance(out[0], brain_mod.Boundary) and out[0] == ""
+
+
+def test_no_boundary_when_progress_spoken(fake, monkeypatch):
+    _on(monkeypatch)
+    b = make(fake, [[tool("Read", file_path="/a/Notes.md"),
+                     StreamEvent("Done. "), ResultMessage()]], enabled=False)
+    out = turn(b, keep_boundaries=True)
+    assert not any(isinstance(s, brain_mod.Boundary) for s in out)
