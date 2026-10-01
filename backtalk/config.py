@@ -128,6 +128,13 @@ DEFAULTS = {
     # default; "low" / "medium" / "high" / "max" applies at launch.
     # Saying "set effort to X" in a voice session saves itself here.
     "effort": "",
+    # Once-a-day automatic first turn. If startup_marker names a file
+    # that doesn't contain today's date (YYYY-MM-DD), backtalk speaks
+    # startup_notice and sends startup_prompt as the first turn right
+    # after warmup. Leave either "" to turn it off (upstream behavior).
+    "startup_marker": "",
+    "startup_prompt": "",
+    "startup_notice": "Running startup.",
     # The voice (Kokoro, local, free). bm_lewis is the proven default —
     # British male, the butler register. Others: bm_george, bm_daniel,
     # bm_fable, am_michael, af_heart... The first letter picks the
@@ -336,8 +343,9 @@ DISCIPLINE = (
     "slashes and folder names read one by one — it is unbearable "
     "aloud and carries no meaning by ear. Same for URLs and long "
     "ids: name the thing, not the address. "
-    "Skip any startup sequence except the once-a-day spoken recap "
-    "your CLAUDE.md defines; otherwise answer directly. "
+    "Skip any startup sequence unless a message asks you to run it; "
+    "the once-a-day spoken recap your CLAUDE.md defines always runs. "
+    "Otherwise answer directly. "
     "VOICE CONSOLE FACTS, answer from these whenever the person asks "
     "you to change a voice-line setting: this session is controlled "
     "by exact spoken phrases, never by you. Permissions: 'stop "

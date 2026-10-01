@@ -948,6 +948,17 @@ async def amain():
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     threading.Thread(target=_inbox_reader, args=(typed_q,), daemon=True).start()
+    marker = str(CFG.get("startup_marker") or "").strip()
+    first = str(CFG.get("startup_prompt") or "").strip()
+    if marker and first:
+        try:
+            with open(marker, encoding="utf-8") as f:
+                stale = time.strftime("%Y-%m-%d") not in f.read()
+        except OSError:
+            stale = True   # no marker yet = never greeted
+        if stale:
+            mouth.say(CFG.get("startup_notice") or "Running startup.")
+            typed_q.put(first)   # same path as a typed turn, reply is spoken
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
