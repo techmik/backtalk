@@ -502,6 +502,12 @@ class Mouth:
         # underneath it. If the turn is still live, leave the state alone
         # (brain owns "working"/"thinking" then) instead of flashing idle.
         self.turn_active = None
+        # The sentence the worker is playing right now (None between
+        # sentences). Lets cancel_texts() cut one specific line short.
+        self._current: str | None = None
+        # Guards _current + the _stop clear at sentence start, so a
+        # cancel_texts() racing a sentence boundary can't flag the NEXT line.
+        self._cur_lock = threading.Lock()
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -535,6 +541,30 @@ class Mouth:
         except queue.Empty:
             pass
 
+    def cancel_texts(self, sentences):
+        """Narrow stop: drop just these sentences from the queue, and cut
+        the current one short if it is one of them. Everything else queued
+        keeps its place. Used when a permission ask is answered (card
+        click, typed or spoken) while the ask is still being read out --
+        unlike shut_up(), it can't swallow a line the agent queued just
+        before the ask."""
+        drop = set(sentences or ())
+        if not drop:
+            return
+        kept = []
+        try:
+            while True:
+                kept.append(self._q.get_nowait())
+        except queue.Empty:
+            pass
+        for item in kept:
+            text = item[0] if isinstance(item, tuple) else item
+            if text not in drop:
+                self._q.put(item)
+        with self._cur_lock:
+            if self._current in drop:
+                self._stop.set()
+
     def shutdown(self):
         """Exit path: stop playback and restore the music SYNCHRONOUSLY
         (the debounced restore timer dies with the process otherwise)."""
@@ -557,7 +587,9 @@ class Mouth:
             sentence, directions = item if isinstance(item, tuple) else (item, None)
             if not sentence:
                 continue
-            self._stop.clear()
+            with self._cur_lock:
+                self._stop.clear()
+                self._current = sentence
             self._speaking.set()
             self.ducker.speech_start()
             signals.static_stop()     # thinking sound dies when speech starts
@@ -567,6 +599,8 @@ class Mouth:
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
+                with self._cur_lock:
+                    self._current = None
                 if self._q.empty():
                     self._speaking.clear()
                     self._last_play_end = time.monotonic()

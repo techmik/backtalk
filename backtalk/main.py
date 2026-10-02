@@ -69,7 +69,7 @@ from backtalk.brain import Boundary, Progress, WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
-from backtalk.mouth import Mouth
+from backtalk.mouth import Mouth, split_sentences
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
 
@@ -286,6 +286,15 @@ def make_permission_gate(mouth):
             _PERM["hinted"] = True
             ask += (" And any time you're done with these checks, say "
                     "stop asking for permission.")
+        # Every line the ask itself speaks (the ask, then "details" or the
+        # auto-approve confirm). An answer cuts these short, so a card
+        # click or typed "yes" doesn't sit through the rest of the question.
+        own_lines = split_sentences(ask)
+
+        def say_own(text):
+            own_lines.extend(split_sentences(text))
+            mouth.say(text)
+
         mouth.say(ask)
         # publish the ask so a face can draw an approve/deny card. The
         # answer still rides .voice_inbox/ ("yes"/"no"/"details") — a
@@ -310,6 +319,7 @@ def make_permission_gate(mouth):
                     except asyncio.TimeoutError:
                         if loop.time() >= deadline:
                             fut.cancel()
+                            mouth.cancel_texts(own_lines)
                             mouth.say("No answer, so I didn't do it.")
                             log("[perm]   timed out, denied")
                             return PermissionResultDeny(
@@ -321,14 +331,16 @@ def make_permission_gate(mouth):
                         # keep the ring honest while we wait
                         if not mouth.speaking:
                             signals.set_state("listening")
+                # answered: stop reading the question out (any channel)
+                mouth.cancel_texts(own_lines)
                 if (got != _INTERRUPT_ANSWER
                         and _norm_speech(got) in _DETAILS):
                     # read the full literal form, then ask again with a
                     # fresh clock: asking for details is engagement,
                     # not silence
                     log("[perm]   details requested")
-                    mouth.say(f"The details: I want to {detail}. "
-                              "Yes or no?")
+                    say_own(f"The details: I want to {detail}. "
+                            "Yes or no?")
                     signals.permission_prompt({"id": perm_id, "tool": tool,
                                                "what": what, "detail": detail,
                                                "phase": "detail"})
@@ -345,10 +357,10 @@ def make_permission_gate(mouth):
                 if (got != _INTERRUPT_ANSWER
                         and _norm_speech(got) in CONSOLE_VERBS["noask"]):
                     log("[perm]   noask requested mid-ask")
-                    mouth.say("Auto-approve means I act without asking, "
-                              "and it becomes your saved default. Say "
-                              "confirm to switch, and I'll go ahead "
-                              "with this one too.")
+                    say_own("Auto-approve means I act without asking, "
+                            "and it becomes your saved default. Say "
+                            "confirm to switch, and I'll go ahead "
+                            "with this one too.")
                     noask_pending = True
                     deadline = loop.time() + PERM_TIMEOUT_S
                     continue

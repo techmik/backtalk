@@ -13,9 +13,13 @@ class _Mouth:
 
     def __init__(self):
         self.said = []
+        self.cancelled = []
 
     def say(self, text):
         self.said.append(text)
+
+    def cancel_texts(self, sentences):
+        self.cancelled.append(list(sentences))
 
 
 @pytest.fixture
@@ -95,3 +99,36 @@ def test_auto_approve_flipped_mid_queue_releases_the_rest(gate, monkeypatch):
     results = asyncio.run(run())
     assert [r.behavior for r in results] == ["allow"] * 3
     assert len(_asks(mouth)) == 1
+
+
+def test_answer_cuts_the_question_short(gate):
+    """A card click / typed "yes" lands while the ask is still being read
+    out: the ask's own sentences are cancelled, and only those."""
+    g, mouth = gate
+
+    async def run():
+        task = _calls(g, 1)[0]
+        f = await _next_pending()
+        f.set_result("yes")
+        return await task
+
+    result = asyncio.run(run())
+    assert result.behavior == "allow"
+    assert mouth.cancelled, "answer did not cancel the spoken ask"
+    cut = mouth.cancelled[-1]
+    assert cut[0] == "Permission check."
+    assert all(s in _asks(mouth)[0] for s in cut)
+
+
+def test_details_lines_are_cut_by_the_final_answer(gate):
+    g, mouth = gate
+
+    async def run():
+        task = _calls(g, 1)[0]
+        (await _next_pending()).set_result("details")
+        (await _next_pending()).set_result("no")
+        return await task
+
+    result = asyncio.run(run())
+    assert result.behavior == "deny"
+    assert any(s.startswith("The details:") for s in mouth.cancelled[-1])
