@@ -31,6 +31,7 @@ never the character.
 import asyncio
 import os
 import re
+import time
 import warnings
 from datetime import datetime
 
@@ -749,6 +750,7 @@ class WarmBrain:
             s["in_tokens"] += (int(u.get("input_tokens") or 0)
                                + int(u.get("cache_read_input_tokens")
                                      or 0))
+            self._publish_cache(u)
             c = getattr(rm, "total_cost_usd", None)
             if c:
                 s["cost"] += float(c)
@@ -758,6 +760,24 @@ class WarmBrain:
                                     cost=round(s["cost"], 4))
         except Exception:
             pass
+
+    def _publish_cache(self, u):
+        """Stamp the prompt-cache clock for a dashboard countdown. A turn
+        that sent no prompt tokens (a slash command's result) is skipped:
+        it would read as a miss without touching the cache at all. The
+        lifetime comes from the turn's own cache_creation split when it
+        reports one: only 5-minute writes means the 5-minute cache, so the
+        clock never overstates. Default is Claude Code's 1-hour cache."""
+        read = int(u.get("cache_read_input_tokens") or 0)
+        wrote = int(u.get("cache_creation_input_tokens") or 0)
+        if not (read or wrote or int(u.get("input_tokens") or 0)):
+            return
+        ttl = 3600
+        cc = u.get("cache_creation") or {}
+        if (int(cc.get("ephemeral_5m_input_tokens") or 0)
+                and not int(cc.get("ephemeral_1h_input_tokens") or 0)):
+            ttl = 300
+        signals.set_cache(time.time(), rebuilt=read == 0, ttl=ttl)
 
     async def _pull_rate_limits(self):
         """Ask the CLI outright how much of the plan is spent.
@@ -863,6 +883,9 @@ class WarmBrain:
         await self._publish_context()
         out = " ".join(texts).strip()
         low = out.lower()
+        if cmd.split()[0] in ("/clear", "/compact") and not (
+                "error" in low or "invalid" in low):
+            signals.set_cache(None)
         if not ("error" in low or "invalid" in low):
             if cmd.startswith("/model "):
                 self._live_model = cmd.split(None, 1)[1].strip()

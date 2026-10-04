@@ -29,6 +29,10 @@ is the whole integration surface:
                         written when show_usage is on
   .voice_context        JSON {used, max, pct} — context-window fill after
                         the latest turn (always written; not spend data)
+  .voice_cache          JSON {at, rebuilt, ttl} — when the prompt cache was
+                        last touched (epoch; null = cold after /clear or
+                        /compact), whether that turn missed it, and its
+                        lifetime in seconds (always written; not spend data)
   .voice_session        JSON {ts, model, effort, mode, mic, degraded,
                         [turns, cost]} — what the session is LIVE on right
                         now, rewritten on every change (a spoken model or
@@ -85,6 +89,7 @@ _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _TRANSCRIPT_FILE = os.path.join(_DIR, ".voice_transcript.jsonl")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _CONTEXT_FILE = os.path.join(_DIR, ".voice_context")
+_CACHE_FILE = os.path.join(_DIR, ".voice_cache")
 _PERMISSION_FILE = os.path.join(_DIR, ".voice_permission")
 _SESSION_FILE = os.path.join(_DIR, ".voice_session")
 
@@ -243,6 +248,20 @@ def set_context(used_tokens, max_tokens, pct=None):
             f.write(json.dumps({"used": used_tokens, "max": max_tokens,
                                 "pct": pct}))
     except (OSError, TypeError, ZeroDivisionError):
+        pass
+
+
+def set_cache(at, rebuilt=False, ttl=3600):
+    """When the prompt cache was last touched, for a countdown like the
+    desktop status band's. `at` is an epoch, or None for a cache known to
+    be cold (/clear, /compact). `rebuilt` = that turn wrote the cache
+    instead of reading it. `ttl` is seconds. Not gated by show_usage:
+    it is timing, not spend. Never raises."""
+    try:
+        with open(_CACHE_FILE, "w") as f:
+            f.write(json.dumps({"at": at, "rebuilt": bool(rebuilt),
+                                "ttl": ttl}))
+    except (OSError, TypeError):
         pass
 
 
