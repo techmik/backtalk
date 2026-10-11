@@ -56,6 +56,7 @@ Flags:
 Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
+import faulthandler
 import json
 import queue
 import re
@@ -63,6 +64,8 @@ import socket
 import sys
 import threading
 import time
+import traceback
+from pathlib import Path
 
 from backtalk import signals
 from backtalk.brain import Boundary, Progress, WarmBrain
@@ -1391,10 +1394,27 @@ def main():
               "broken. Use the window that is already open, or close it "
               "and start again.", flush=True)
         sys.exit(1)
+    # A native crash (segfault in a C extension) kills the process before
+    # any Python handler runs, so nothing reached backtalk.log and the only
+    # trace was a console window that closed on "press any key" (field case
+    # 2026-10-11). faulthandler writes every thread's stack to crash.log
+    # even then; ordinary exceptions get their traceback logged below.
+    try:
+        _crash_dir = Path(__file__).resolve().parent.parent / "logs"
+        _crash_dir.mkdir(parents=True, exist_ok=True)
+        _crash_f = open(_crash_dir / "crash.log", "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_f, all_threads=True)
+    except OSError:
+        pass
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
         print("\n[backtalk] interrupted — hanging up", flush=True)
+    except SystemExit:
+        raise                    # a deliberate exit is not a crash
+    except BaseException:
+        log("[backtalk] CRASHED:\n" + traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
