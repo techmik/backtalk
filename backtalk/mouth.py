@@ -601,9 +601,13 @@ class Mouth:
             finally:
                 with self._cur_lock:
                     self._current = None
+                # Stamped per sentence, not only on drain: a multi-sentence
+                # reply queues all at once, and a drain-only stamp left every
+                # sentence of it looking "idle", so _get_out re-initialised
+                # PortAudio before each one (2026-10-11 log).
+                self._last_play_end = time.monotonic()
                 if self._q.empty():
                     self._speaking.clear()
-                    self._last_play_end = time.monotonic()
                     # The reply has genuinely stopped talking, as opposed to
                     # the gap between two sentences of the same reply.
                     signals.reply_done()
@@ -636,15 +640,23 @@ class Mouth:
         idle_s = float(CFG.get("speaker_recheck_idle_s", 10) or 0)
         if (idle_s and self._out is not None and self._last_play_end
                 and time.monotonic() - self._last_play_end > idle_s):
-            try:
-                sd._terminate()
-                sd._initialize()
-                self._drop_out()   # the held stream died with _terminate;
-                #                    forget it so the rebuild below is clean
-                log("[mouth] refreshed the audio system after an idle gap "
-                    "— the voice will follow a mid-session output switch")
-            except Exception as e:
-                log(f"[mouth] idle audio refresh failed ({e}) — continuing")
+            # Never while the mic is open (see ears.PA_LOCK): skip, keep
+            # the current stream, and try again on a later sentence.
+            from backtalk.ears import PA_LOCK
+            if not PA_LOCK.acquire(blocking=False):
+                log("[mouth] idle audio refresh skipped — the mic is open")
+            else:
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                    self._drop_out()   # the held stream died with _terminate;
+                    #                    forget it so the rebuild below is clean
+                    log("[mouth] refreshed the audio system after an idle gap "
+                        "— the voice will follow a mid-session output switch")
+                except Exception as e:
+                    log(f"[mouth] idle audio refresh failed ({e}) — continuing")
+                finally:
+                    PA_LOCK.release()
         dev = _speaker_index()
         if (self._out is not None and self._out_rate == rate
                 and self._out_dev == dev):
@@ -722,15 +734,23 @@ class Mouth:
         needless race. Returns False (and logs) if the audio system will
         not come back up.
         """
-        try:
-            sd._terminate()
-        except Exception:
-            pass                       # already down; re-init is the point
-        try:
-            sd._initialize()
-        except Exception as e:
-            log(f"[mouth] could not re-initialise the audio system: {e}")
+        from backtalk.ears import PA_LOCK
+        if not PA_LOCK.acquire(blocking=False):
+            # open-mic mode holds the mic between turns; see ears.PA_LOCK
+            log("[mouth] audio rebuild skipped — the mic is open")
             return False
+        try:
+            try:
+                sd._terminate()
+            except Exception:
+                pass                       # already down; re-init is the point
+            try:
+                sd._initialize()
+            except Exception as e:
+                log(f"[mouth] could not re-initialise the audio system: {e}")
+                return False
+        finally:
+            PA_LOCK.release()
         log("[mouth] audio system rebuilt — next sentence opens on the "
             "current default output device")
         return True

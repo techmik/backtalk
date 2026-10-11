@@ -46,6 +46,15 @@ MAX_UTTER_S = 30
 
 _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 
+# Held for as long as a capture stream is open. Mouth._get_out's idle-gap
+# PortAudio refresh (sd._terminate/_initialize) takes it non-blocking and
+# skips the refresh when the mic is open: tearing PortAudio down under a
+# live InputStream and then closing that stream corrupts the heap
+# (0xc0000374, field case 2026-10-11 -- a spoken answer to a permission
+# ask, recorded while the ask was still being spoken). Re-entrant so
+# _reopen_after_device_change can run inside a held open.
+PA_LOCK = threading.RLock()
+
 _model = None
 _model_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
@@ -395,7 +404,7 @@ class Ears:
         in_utterance = False
         elapsed = 0.0
 
-        with _open_mic() as stream:
+        with PA_LOCK, _open_mic() as stream:
             while True:
                 block, _ = stream.read(FRAME_LEN)
                 elapsed += FRAME_MS / 1000
@@ -442,7 +451,7 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
     frames: list[np.ndarray] = []
-    with _open_mic() as stream:
+    with PA_LOCK, _open_mic() as stream:
         while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
             block, _ = stream.read(FRAME_LEN)
             frames.append(block[:, 0].copy())
