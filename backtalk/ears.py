@@ -55,6 +55,30 @@ _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 # _reopen_after_device_change can run inside a held open.
 PA_LOCK = threading.RLock()
 
+# Held by the mouth around every touch of its output stream, and by every
+# PortAudio teardown (pa_rebuild). Tearing PortAudio down while the mouth's
+# thread is inside a write on its stream crashes the process (reproduced
+# 2026-10-11 by a stress test: _reopen_after_device_change under a
+# speaking mouth segfaults within seconds). PA_GEN counts teardowns: a stream opened under an older generation
+# was freed by the teardown and must be forgotten, never touched or closed.
+# Lock order: PA_LOCK before OUT_LOCK; the mouth takes PA_LOCK only
+# non-blocking while holding OUT_LOCK, so the two can't deadlock.
+OUT_LOCK = threading.RLock()
+PA_GEN = 0
+
+
+def pa_rebuild():
+    """Tear PortAudio down and bring it back up, safely against the mouth.
+    Every open stream dies; the mouth sees PA_GEN move and reopens."""
+    global PA_GEN
+    with OUT_LOCK:
+        try:
+            sd._terminate()
+        except Exception:
+            pass                       # already down; re-initialising is the point
+        PA_GEN += 1
+        sd._initialize()
+
 _model = None
 _model_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
@@ -172,11 +196,7 @@ def _reopen_after_device_change(opts):
     remove that guard without removing this.
     """
     log("[ears] the audio devices changed -- rebuilding and reopening")
-    try:
-        sd._terminate()
-    except Exception:
-        pass                           # already down; re-initialising is the point
-    sd._initialize()
+    pa_rebuild()
     return sd.InputStream(**opts)
 
 

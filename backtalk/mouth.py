@@ -490,6 +490,9 @@ class Mouth:
         # — a renumbering or a default switch, neither of which raises
         # (see _speaker_index). _get_out rebuilds when it does.
         self._out_dev: int | None = None
+        # ears.PA_GEN when the held stream was opened. A PortAudio
+        # teardown since then freed it: forget it, never touch it.
+        self._out_gen: int | None = None
         # monotonic time the last reply finished speaking. _get_out uses
         # the gap since then to decide whether to refresh PortAudio's
         # cached device list before the next reply — see the comment
@@ -637,26 +640,30 @@ class Mouth:
         # default is NOW. One faint onset blip, only after an idle gap,
         # landing where a reply is starting anyway. Threshold is
         # config so a machine that swaps devices rarely can raise it.
+        from backtalk import ears
+        with ears.OUT_LOCK:
+            return self._get_out_locked(rate, ears)
+
+    def _get_out_locked(self, rate: int, ears) -> sd.OutputStream:
         idle_s = float(CFG.get("speaker_recheck_idle_s", 10) or 0)
         if (idle_s and self._out is not None and self._last_play_end
                 and time.monotonic() - self._last_play_end > idle_s):
             # Never while the mic is open (see ears.PA_LOCK): skip, keep
             # the current stream, and try again on a later sentence.
-            from backtalk.ears import PA_LOCK
-            if not PA_LOCK.acquire(blocking=False):
+            if not ears.PA_LOCK.acquire(blocking=False):
                 log("[mouth] idle audio refresh skipped — the mic is open")
             else:
                 try:
-                    sd._terminate()
-                    sd._initialize()
-                    self._drop_out()   # the held stream died with _terminate;
-                    #                    forget it so the rebuild below is clean
+                    ears.pa_rebuild()  # frees the held stream; the gen
+                    #                    check below forgets it
                     log("[mouth] refreshed the audio system after an idle gap "
                         "— the voice will follow a mid-session output switch")
                 except Exception as e:
                     log(f"[mouth] idle audio refresh failed ({e}) — continuing")
                 finally:
-                    PA_LOCK.release()
+                    ears.PA_LOCK.release()
+        if self._out is not None and self._out_gen != ears.PA_GEN:
+            self._forget_out()         # freed by a teardown (ours or the ears')
         dev = _speaker_index()
         if (self._out is not None and self._out_rate == rate
                 and self._out_dev == dev):
@@ -681,8 +688,20 @@ class Mouth:
                                     dtype="int16", device=dev)
         self._out_rate = rate
         self._out_dev = dev
+        self._out_gen = ears.PA_GEN
         self._out.start()
         return self._out
+
+    def _write_out(self, out, pcm, rate: int):
+        """One block to the speaker, under ears.OUT_LOCK so no teardown can
+        land mid-write. If a teardown freed `out` since it was handed
+        out, reopen and write there instead. Returns the stream written to."""
+        from backtalk import ears
+        with ears.OUT_LOCK:
+            if out is not self._out or self._out_gen != ears.PA_GEN:
+                out = self._get_out(rate)
+            out.write(pcm)
+            return out
 
     def _cut(self):
         """Barge-in cut: stop feeding audio and pad the line with a beat
@@ -690,25 +709,36 @@ class Mouth:
         re-triggers the onset blip on latch-happy audio setups). Cost:
         the device buffer (~0.1s) plays out after the kill order — half a
         syllable of tail."""
-        try:
-            zeros = np.zeros(2205, dtype=np.int16)
-            for _ in range(3):
-                self._out.write(zeros)
-        except Exception:
-            self._drop_out()
+        from backtalk import ears
+        with ears.OUT_LOCK:
+            if self._out is None or self._out_gen != ears.PA_GEN:
+                return                 # nothing live to pad
+            try:
+                zeros = np.zeros(2205, dtype=np.int16)
+                for _ in range(3):
+                    self._out.write(zeros)
+            except Exception:
+                self._drop_out()
 
     def _drop_out(self):
         """Close and forget the stream — the next sentence reopens
         fresh. The self-heal path for device errors (interface
-        unplugged, audio mixer restarted)."""
-        if self._out is not None:
-            try:
-                self._out.close(ignore_errors=True)
-            except Exception:
-                pass
+        unplugged, audio mixer restarted). A stream from an older
+        PortAudio generation was already freed: forget it, don't close."""
+        from backtalk import ears
+        with ears.OUT_LOCK:
+            if self._out is not None and self._out_gen == ears.PA_GEN:
+                try:
+                    self._out.close(ignore_errors=True)
+                except Exception:
+                    pass
+            self._forget_out()
+
+    def _forget_out(self):
         self._out = None
         self._out_rate = None
         self._out_dev = None
+        self._out_gen = None
 
     def rebuild_audio(self) -> bool:
         """Tear down and re-initialise PortAudio so the NEXT sentence
@@ -734,23 +764,18 @@ class Mouth:
         needless race. Returns False (and logs) if the audio system will
         not come back up.
         """
-        from backtalk.ears import PA_LOCK
-        if not PA_LOCK.acquire(blocking=False):
+        from backtalk import ears
+        if not ears.PA_LOCK.acquire(blocking=False):
             # open-mic mode holds the mic between turns; see ears.PA_LOCK
             log("[mouth] audio rebuild skipped — the mic is open")
             return False
         try:
-            try:
-                sd._terminate()
-            except Exception:
-                pass                       # already down; re-init is the point
-            try:
-                sd._initialize()
-            except Exception as e:
-                log(f"[mouth] could not re-initialise the audio system: {e}")
-                return False
+            ears.pa_rebuild()
+        except Exception as e:
+            log(f"[mouth] could not re-initialise the audio system: {e}")
+            return False
         finally:
-            PA_LOCK.release()
+            ears.PA_LOCK.release()
         log("[mouth] audio system rebuilt — next sentence opens on the "
             "current default output device")
         return True
@@ -783,10 +808,11 @@ class Mouth:
                 _sig.direction(directions)
 
             def _write(pcm):
+                nonlocal out
                 for i in range(0, len(pcm), block):
                     if self._stop.is_set():
                         return False
-                    out.write(pcm[i:i + block])
+                    out = self._write_out(out, pcm[i:i + block], rate)
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".
